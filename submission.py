@@ -15,10 +15,9 @@ ab_dtype = cutlass.Float4E2M1FN  # FP4 data type for A and B
 sf_dtype = cutlass.Float8E4M3FN  # FP8 data type for scale factors
 c_dtype = cutlass.Float16  # FP16 output type
 sf_vec_size = 16  # Scale factor block size (16 elements share one scale)
-threads_per_cta = 128  # Number of threads per CUDA thread block
-threads_per_m = 32  # Number of threads per CUDA thread block
-threads_per_k  = 32
-mma_tiler_mnk = (threads_per_m, 1, 256)  # Tile sizes for M, N, K dimensions
+threads_per_m = 16  # Number of threads per CUDA thread block
+threads_per_k  = 16
+mma_tiler_mnk = (threads_per_m, 1, 128)  # Tile sizes for M, N, K dimensions
 accum_dtype = cutlass.Float32  # Float32 accumulation buffer
 
 
