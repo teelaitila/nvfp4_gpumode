@@ -10,7 +10,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 
 # Kernel configuration parameters
-mma_tiler_mnk = (128, 1, 64)  # Tile sizes for M, N, K dimensions
 ab_dtype = cutlass.Float4E2M1FN  # FP4 data type for A and B
 sf_dtype = cutlass.Float8E4M3FN  # FP8 data type for scale factors
 c_dtype = cutlass.Float16  # FP16 output type
