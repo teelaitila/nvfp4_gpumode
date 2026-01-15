@@ -32,14 +32,10 @@ sf_vec_size = 16
 threads_per_cta = 128  
 # Stage numbers of shared memory and tmem
 num_acc_stage = 1
-num_ab_stage = 2  # Increased for better pipelining with warp specialization
+num_ab_stage = 2  # Overlap TMA loads with MMA computation
 num_c_stage = 2   # Overlap R2S writes with TMA S2G stores
 # Total number of columns in tmem
 num_tmem_alloc_cols = 512
-
-# Warp specialization IDs
-tma_warp_id = 0   # Warp 0: TMA loads
-mma_warp_id = 1   # Warp 1: MMA compute
 
 
 # Helper function for ceiling division
@@ -72,12 +68,13 @@ def kernel(
     c_smem_layout_staged: cute.ComposedLayout,  # SMEM layout for C epilogue
     epi_tile: cute.Tile,  # Epilogue tile for partitioning
     c_layout: cutlass.Constexpr[utils.LayoutEnum],  # Layout enum for C tensor (compile-time)
+    tile_sched_params: utils.PersistentTileSchedulerParams,  # Persistent tile scheduler params
     num_tma_load_bytes: cutlass.Constexpr[int],
     epilogue_op: cutlass.Constexpr = lambda x: x
     * (1.0 / (1.0 + cute.math.exp(-x, fastmath=True))),
 ):
     """
-    GPU device kernel performing the batched GEMM computation.
+    GPU device kernel performing the batched GEMM computation with persistent scheduling.
     """
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -90,15 +87,17 @@ def kernel(
     bidx, bidy, bidz = cute.arch.block_idx()
     mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
 
-    # Coords outside cluster
-    cta_coord = (bidx, bidy, bidz)
-    mma_tile_coord_mnl = (
-        cta_coord[0] // cute.size(tiled_mma.thr_id.shape),
-        cta_coord[1],
-        cta_coord[2],
-    )
     # Coord inside cta
     tidx, _, _ = cute.arch.thread_idx()
+    
+    #
+    # Create persistent tile scheduler
+    #
+    tile_sched = utils.StaticPersistentTileScheduler.create(
+        tile_sched_params,
+        cute.arch.block_idx(),
+        cute.arch.grid_dim(),
+    )
 
     #
     # Define shared storage for kernel
@@ -448,306 +447,326 @@ def kernel(
     tCtSFB2_compact_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB2_compact)
 
     #
-    # Slice to per mma tile index
+    # Persistent tile loop - each CTA processes multiple output tiles
     #
-    # ((atom_v, rest_v), RestK)
-    tAgA = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
-    # ((atom_v, rest_v), RestK)
-    tBgB1 = tBgB1[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
-    # ((atom_v, rest_v), RestK)
-    tBgB2 = tBgB2[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
-    # ((atom_v, rest_v), RestK)
-    tAgSFA = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
-    # ((atom_v, rest_v), RestK)
-    tBgSFB1 = tBgSFB1[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
-    # ((atom_v, rest_v), RestK)
-    tBgSFB2 = tBgSFB2[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
-
-    #
-    # WARP SPECIALIZATION: Split TMA and MMA into separate warps
-    #
+    work_tile = tile_sched.initial_work_tile_info()
     
-    # TMA Warp: handles all memory loads
-    if warp_idx == tma_warp_id:
-        for k_tile in range(k_tile_cnt):
-            # Acquire empty buffer slot
-            ab_empty = ab_producer.acquire_and_advance()
-
-            # TMA load A/B1/B2/SFA/SFB1/SFB2 to shared memory
-            cute.copy(
-                tma_atom_a,
-                tAgA[(None, ab_empty.count)],
-                tAsA[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-            )
-            cute.copy(
-                tma_atom_b1,
-                tBgB1[(None, ab_empty.count)],
-                tBsB1[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-            )
-            cute.copy(
-                tma_atom_b2,
-                tBgB2[(None, ab_empty.count)],
-                tBsB2[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-            )
-            cute.copy(
-                tma_atom_sfa,
-                tAgSFA[((0, None), ab_empty.count)],
-                tAsSFA[((0, None), ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-            )
-            cute.copy(
-                tma_atom_sfb1,
-                tBgSFB1[((0, None), ab_empty.count)],
-                tBsSFB1[((0, None), ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-            )
-            cute.copy(
-                tma_atom_sfb2,
-                tBgSFB2[((0, None), ab_empty.count)],
-                tBsSFB2[((0, None), ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-            )
-
-    # MMA Warp: handles all computation
-    if warp_idx == mma_warp_id:
-        # Acquire accumulator buffer
-        acc_empty = acc_producer.acquire_and_advance()
-        # Set ACCUMULATE field to False for the first k_tile iteration
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+    while work_tile.is_valid_tile:
+        # Get tile coordinates from scheduler
+        cur_tile_coord = work_tile.tile_idx
+        mma_tile_coord_mnl = (
+            cur_tile_coord[0],
+            cur_tile_coord[1],
+            cur_tile_coord[2],
+        )
         
-        for k_tile in range(k_tile_cnt):
-            # Wait for TMA data to be ready
-            ab_full = ab_consumer.wait_and_advance()
-
-            # Copy SFA/SFB1/SFB2 to tmem
-            s2t_stage_coord = (None, None, None, None, ab_full.index)
-            tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
-            tCsSFB1_compact_s2t_staged = tCsSFB1_compact_s2t[s2t_stage_coord]
-            tCsSFB2_compact_s2t_staged = tCsSFB2_compact_s2t[s2t_stage_coord]
-            cute.copy(
-                tiled_copy_s2t_sfa,
-                tCsSFA_compact_s2t_staged,
-                tCtSFA_compact_s2t,
-            )
-            cute.copy(
-                tiled_copy_s2t_sfb,
-                tCsSFB1_compact_s2t_staged,
-                tCtSFB1_compact_s2t,
-            )
-            cute.copy(
-                tiled_copy_s2t_sfb,
-                tCsSFB2_compact_s2t_staged,
-                tCtSFB2_compact_s2t,
-            )
-
-            # tCtAcc1 += tCrA * tCrSFA * tCrB1 * tCrSFB1
-            # tCtAcc2 += tCrA * tCrSFA * tCrB2 * tCrSFB2
-            num_kblocks = cute.size(tCrA, mode=[2])
-            for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                kblock_coord = (
-                    None,
-                    None,
-                    kblock_idx,
-                    ab_full.index,
-                )
-
-                # Set SFA/SFB tensor to tiled_mma
-                sf_kblock_coord = (None, None, kblock_idx)
-                tiled_mma.set(
-                    tcgen05.Field.SFA,
-                    tCtSFA[sf_kblock_coord].iterator,
-                )
-                tiled_mma.set(
-                    tcgen05.Field.SFB,
-                    tCtSFB1[sf_kblock_coord].iterator,
-                )
-                cute.gemm(
-                    tiled_mma,
-                    tCtAcc1,
-                    tCrA[kblock_coord],
-                    tCrB1[kblock_coord],
-                    tCtAcc1,
-                )
-
-                tiled_mma.set(
-                    tcgen05.Field.SFB,
-                    tCtSFB2[sf_kblock_coord].iterator,
-                )
-                cute.gemm(
-                    tiled_mma,
-                    tCtAcc2,
-                    tCrA[kblock_coord],
-                    tCrB2[kblock_coord],
-                    tCtAcc2,
-                )
-
-                # Enable accumulate on tCtAcc1/tCtAcc2 after first kblock
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-
-            # Signal TMA warp that this buffer slot is free
-            ab_full.release()
+        # Reset pipelines for each new tile (critical for persistent kernels!)
+        ab_producer.reset()
+        ab_consumer.reset()
+        acc_producer.reset()
+        acc_consumer.reset()
         
-        # Commit accumulator to epilogue
-        acc_empty.commit()
+        #
+        # Slice to per mma tile index (inside tile loop)
+        #
+        # ((atom_v, rest_v), RestK)
+        tAgA_tile = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
+        # ((atom_v, rest_v), RestK)
+        tBgB1_tile = tBgB1[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+        # ((atom_v, rest_v), RestK)
+        tBgB2_tile = tBgB2[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+        # ((atom_v, rest_v), RestK)
+        tAgSFA_tile = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
+        # ((atom_v, rest_v), RestK)
+        tBgSFB1_tile = tBgSFB1[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+        # ((atom_v, rest_v), RestK)
+        tBgSFB2_tile = tBgSFB2[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
-    #
-    # Epilogue with TMA store
-    #
-    
-    acc_dtype = cutlass.Float32
-    cta_tile_shape_mnk = (
-        mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
-        mma_tiler_mnk[1],
-        mma_tiler_mnk[2],
-    )
-    
-    # Get the TMEM load copy atom using helper
-    copy_atom_t2r = sm100_utils.get_tmem_load_op(
-        cta_tile_shape_mnk,
-        c_layout,
-        c_dtype,
-        acc_dtype,
-        epi_tile,
-        False,  # use_2cta_instrs
-    )
-    
-    # Flat divide accumulators by epilogue tile
-    # Our accumulator has shape (MMA, MMA_M, MMA_N)
-    # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
-    tCtAcc1_epi = cute.flat_divide(
-        tCtAcc1[((None, None), 0, 0)],
-        epi_tile,
-    )
-    tCtAcc2_epi = cute.flat_divide(
-        tCtAcc2[((None, None), 0, 0)],
-        epi_tile,
-    )
-    
-    # Create T2R tiled copy
-    tiled_copy_t2r = tcgen05.make_tmem_copy(
-        copy_atom_t2r, tCtAcc1_epi[(None, None, 0, 0)]
-    )
-    thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-    
-    # Partition accumulators (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
-    tTR_tAcc1 = thr_copy_t2r.partition_S(tCtAcc1_epi)
-    tTR_tAcc2 = thr_copy_t2r.partition_S(tCtAcc2_epi)
-    
-    # Flat divide global C by epilogue tile
-    # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
-    gC_epi = cute.flat_divide(
-        tCgC[((None, None), 0, 0, None, None, None)], epi_tile
-    )
-    # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
-    tTR_gC = thr_copy_t2r.partition_D(gC_epi)
-    
-    # Register tensors for accumulator
-    tTR_rAcc1 = cute.make_rmem_tensor(
-        tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, acc_dtype
-    )
-    tTR_rAcc2 = cute.make_rmem_tensor(
-        tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, acc_dtype
-    )
-    tTR_rC = cute.make_rmem_tensor(
-        tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, c_dtype
-    )
-    
-    # Setup R2S copy (Register to SMEM)
-    copy_atom_r2s = sm100_utils.get_smem_store_op(
-        c_layout, c_dtype, acc_dtype, tiled_copy_t2r
-    )
-    tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
-    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-    
-    # Partition SMEM for R2S (R2S, R2S_M, R2S_N, STAGE)
-    tRS_sC = thr_copy_r2s.partition_D(sC)
-    # Retile register tensor for R2S
-    tRS_rC = tiled_copy_r2s.retile(tTR_rC)
-    
-    # Setup TMA partition for SMEM to Global - need separate partition per stage
-    gC_for_tma = cute.group_modes(gC_epi, 0, 2)
-    
-    # Create TMA partitions for each stage
-    sC_stage0 = cute.group_modes(sC[(None, None, 0)], 0, 2)
-    sC_stage1 = cute.group_modes(sC[(None, None, 1)], 0, 2)
-    bSG_sC_0, bSG_gC = cpasync.tma_partition(
-        tma_atom_c,
-        0,  # CTA coordinate
-        cute.make_layout(1),  # Single CTA
-        sC_stage0,
-        gC_for_tma,
-    )
-    bSG_sC_1, _ = cpasync.tma_partition(
-        tma_atom_c,
-        0,
-        cute.make_layout(1),
-        sC_stage1,
-        gC_for_tma,
-    )
-    
-    # Slice to current tile
-    bSG_gC = bSG_gC[(None, None, None, *mma_tile_coord_mnl)]
+        #
+        # Execute Data copy and Math computation in the k_tile loop
+        #
+        if warp_idx == 0:
+            # Wait for accumulator buffer empty
+            acc_empty = acc_producer.acquire_and_advance()
+            # Set ACCUMULATE field to False for the first k_tile iteration
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            # Execute k_tile loop
+            for k_tile in range(k_tile_cnt):
+                # Wait for AB buffer empty
+                ab_empty = ab_producer.acquire_and_advance()
 
-    # Wait for accumulator buffer full
-    acc_full = acc_consumer.wait_and_advance()
+                #  TMA load A/B1/B2/SFA/SFB1/SFB2 to shared memory
+                cute.copy(
+                    tma_atom_a,
+                    tAgA_tile[(None, ab_empty.count)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_b1,
+                    tBgB1_tile[(None, ab_empty.count)],
+                    tBsB1[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_b2,
+                    tBgB2_tile[(None, ab_empty.count)],
+                    tBsB2[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_sfa,
+                    tAgSFA_tile[((0, None), ab_empty.count)],
+                    tAsSFA[((0, None), ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_sfb1,
+                    tBgSFB1_tile[((0, None), ab_empty.count)],
+                    tBsSFB1[((0, None), ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_sfb2,
+                    tBgSFB2_tile[((0, None), ab_empty.count)],
+                    tBsSFB2[((0, None), ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
 
-    # Epilogue loop over subtiles with 2-stage pipelining
-    epi_m_tiles = cute.size(tTR_tAcc1.shape, mode=[3])
-    epi_n_tiles = cute.size(tTR_tAcc1.shape, mode=[4])
-    
-    # Track in-flight TMA stores (0 = none, 1 = stage 0, 2 = stage 1)
-    stage_idx = cutlass.Int32(0)
-    
-    for epi_m in cutlass.range(epi_m_tiles):
-        for epi_n in cutlass.range(epi_n_tiles):
-            # Copy accumulator to register (T2R)
-            cute.copy(tiled_copy_t2r, tTR_tAcc1[(None, None, None, epi_m, epi_n)], tTR_rAcc1)
-            cute.copy(tiled_copy_t2r, tTR_tAcc2[(None, None, None, epi_m, epi_n)], tTR_rAcc2)
+                # Wait for AB buffer full
+                ab_full = ab_consumer.wait_and_advance()
 
-            # Silu activation on acc1 and multiply with acc2
-            acc_vec1 = epilogue_op(tTR_rAcc1.load())
-            acc_vec2 = tTR_rAcc2.load()
-            acc_vec = acc_vec1 * acc_vec2
-            tTR_rC.store(acc_vec.to(c_dtype))
-            
-            # Store from registers to SMEM using R2S copy (alternating stages)
-            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, stage_idx)])
-            
-            # Fence to ensure R2S completes before TMA reads SMEM
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
-            )
-            cute.arch.barrier()
-            
-            # TMA store from SMEM to Global (one warp issues TMA)
-            if warp_idx == 0:
-                # Select source SMEM buffer based on stage
-                if stage_idx == 0:
-                    cute.copy(tma_atom_c, bSG_sC_0, bSG_gC[(None, epi_m, epi_n)])
-                else:
-                    cute.copy(tma_atom_c, bSG_sC_1, bSG_gC[(None, epi_m, epi_n)])
-                cute.arch.cp_async_bulk_commit_group()
+                #  Copy SFA/SFB1/SFB2 to tmem
+                s2t_stage_coord = (None, None, None, None, ab_full.index)
+                tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
+                tCsSFB1_compact_s2t_staged = tCsSFB1_compact_s2t[s2t_stage_coord]
+                tCsSFB2_compact_s2t_staged = tCsSFB2_compact_s2t[s2t_stage_coord]
+                cute.copy(
+                    tiled_copy_s2t_sfa,
+                    tCsSFA_compact_s2t_staged,
+                    tCtSFA_compact_s2t,
+                )
+                cute.copy(
+                    tiled_copy_s2t_sfb,
+                    tCsSFB1_compact_s2t_staged,
+                    tCtSFB1_compact_s2t,
+                )
+                cute.copy(
+                    tiled_copy_s2t_sfb,
+                    tCsSFB2_compact_s2t_staged,
+                    tCtSFB2_compact_s2t,
+                )
+
+                # tCtAcc1 += tCrA * tCrSFA * tCrB1 * tCrSFB1
+                # tCtAcc2 += tCrA * tCrSFA * tCrB2 * tCrSFB2
+                num_kblocks = cute.size(tCrA, mode=[2])
+                for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                    kblock_coord = (
+                        None,
+                        None,
+                        kblock_idx,
+                        ab_full.index,
+                    )
+
+                    # Set SFA/SFB tensor to tiled_mma
+                    sf_kblock_coord = (None, None, kblock_idx)
+                    tiled_mma.set(
+                        tcgen05.Field.SFA,
+                        tCtSFA[sf_kblock_coord].iterator,
+                    )
+                    tiled_mma.set(
+                        tcgen05.Field.SFB,
+                        tCtSFB1[sf_kblock_coord].iterator,
+                    )
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc1,
+                        tCrA[kblock_coord],
+                        tCrB1[kblock_coord],
+                        tCtAcc1,
+                    )
+
+                    tiled_mma.set(
+                        tcgen05.Field.SFB,
+                        tCtSFB2[sf_kblock_coord].iterator,
+                    )
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc2,
+                        tCrA[kblock_coord],
+                        tCrB2[kblock_coord],
+                        tCtAcc2,
+                    )
+
+                    # Enable accumulate on tCtAcc1/tCtAcc2 after first kblock
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+
+                # Async arrive AB buffer empty
+                ab_full.release()
+            acc_empty.commit()
+
+        #
+        # Epilogue with TMA store
+        #
+        
+        acc_dtype = cutlass.Float32
+        cta_tile_shape_mnk = (
+            mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
+            mma_tiler_mnk[1],
+            mma_tiler_mnk[2],
+        )
+        
+        # Get the TMEM load copy atom using helper
+        copy_atom_t2r = sm100_utils.get_tmem_load_op(
+            cta_tile_shape_mnk,
+            c_layout,
+            c_dtype,
+            acc_dtype,
+            epi_tile,
+            False,  # use_2cta_instrs
+        )
+        
+        # Flat divide accumulators by epilogue tile
+        # Our accumulator has shape (MMA, MMA_M, MMA_N)
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+        tCtAcc1_epi = cute.flat_divide(
+            tCtAcc1[((None, None), 0, 0)],
+            epi_tile,
+        )
+        tCtAcc2_epi = cute.flat_divide(
+            tCtAcc2[((None, None), 0, 0)],
+            epi_tile,
+        )
+        
+        # Create T2R tiled copy
+        tiled_copy_t2r = tcgen05.make_tmem_copy(
+            copy_atom_t2r, tCtAcc1_epi[(None, None, 0, 0)]
+        )
+        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        
+        # Partition accumulators (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+        tTR_tAcc1 = thr_copy_t2r.partition_S(tCtAcc1_epi)
+        tTR_tAcc2 = thr_copy_t2r.partition_S(tCtAcc2_epi)
+        
+        # Flat divide global C by epilogue tile
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
+        gC_epi = cute.flat_divide(
+            tCgC[((None, None), 0, 0, None, None, None)], epi_tile
+        )
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
+        tTR_gC = thr_copy_t2r.partition_D(gC_epi)
+        
+        # Register tensors for accumulator
+        tTR_rAcc1 = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, acc_dtype
+        )
+        tTR_rAcc2 = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, acc_dtype
+        )
+        tTR_rC = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, c_dtype
+        )
+        
+        # Setup R2S copy (Register to SMEM)
+        copy_atom_r2s = sm100_utils.get_smem_store_op(
+            c_layout, c_dtype, acc_dtype, tiled_copy_t2r
+        )
+        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
+        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+        
+        # Partition SMEM for R2S (R2S, R2S_M, R2S_N, STAGE)
+        tRS_sC = thr_copy_r2s.partition_D(sC)
+        # Retile register tensor for R2S
+        tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+        
+        # Setup TMA partition for SMEM to Global - need separate partition per stage
+        gC_for_tma = cute.group_modes(gC_epi, 0, 2)
+        
+        # Create TMA partitions for each stage
+        sC_stage0 = cute.group_modes(sC[(None, None, 0)], 0, 2)
+        sC_stage1 = cute.group_modes(sC[(None, None, 1)], 0, 2)
+        bSG_sC_0, bSG_gC = cpasync.tma_partition(
+            tma_atom_c,
+            0,  # CTA coordinate
+            cute.make_layout(1),  # Single CTA
+            sC_stage0,
+            gC_for_tma,
+        )
+        bSG_sC_1, _ = cpasync.tma_partition(
+            tma_atom_c,
+            0,
+            cute.make_layout(1),
+            sC_stage1,
+            gC_for_tma,
+        )
+        
+        # Slice to current tile
+        bSG_gC = bSG_gC[(None, None, None, *mma_tile_coord_mnl)]
+
+        # Wait for accumulator buffer full
+        acc_full = acc_consumer.wait_and_advance()
+
+        # Epilogue loop over subtiles with 2-stage pipelining
+        epi_m_tiles = cute.size(tTR_tAcc1.shape, mode=[3])
+        epi_n_tiles = cute.size(tTR_tAcc1.shape, mode=[4])
+        
+        # Track in-flight TMA stores (0 = none, 1 = stage 0, 2 = stage 1)
+        stage_idx = cutlass.Int32(0)
+        
+        for epi_m in cutlass.range(epi_m_tiles):
+            for epi_n in cutlass.range(epi_n_tiles):
+                # Copy accumulator to register (T2R)
+                cute.copy(tiled_copy_t2r, tTR_tAcc1[(None, None, None, epi_m, epi_n)], tTR_rAcc1)
+                cute.copy(tiled_copy_t2r, tTR_tAcc2[(None, None, None, epi_m, epi_n)], tTR_rAcc2)
+
+                # Silu activation on acc1 and multiply with acc2
+                acc_vec1 = epilogue_op(tTR_rAcc1.load())
+                acc_vec2 = tTR_rAcc2.load()
+                acc_vec = acc_vec1 * acc_vec2
+                tTR_rC.store(acc_vec.to(c_dtype))
                 
-                # Wait for at most 1 TMA in flight (pipelining!)
-                # This allows the previous TMA to complete while we process the next tile
-                cute.arch.cp_async_bulk_wait_group(1, read=True)
-            
-            cute.arch.barrier()
-            
-            # Alternate stage for next iteration
-            stage_idx = 1 - stage_idx
-    
-    # Wait for all remaining TMA stores to complete
-    if warp_idx == 0:
-        cute.arch.cp_async_bulk_wait_group(0, read=True)
-    cute.arch.barrier()
+                # Store from registers to SMEM using R2S copy (alternating stages)
+                cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, stage_idx)])
+                
+                # Fence to ensure R2S completes before TMA reads SMEM
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                cute.arch.barrier()
+                
+                # TMA store from SMEM to Global (one warp issues TMA)
+                if warp_idx == 0:
+                    # Select source SMEM buffer based on stage
+                    if stage_idx == 0:
+                        cute.copy(tma_atom_c, bSG_sC_0, bSG_gC[(None, epi_m, epi_n)])
+                    else:
+                        cute.copy(tma_atom_c, bSG_sC_1, bSG_gC[(None, epi_m, epi_n)])
+                    cute.arch.cp_async_bulk_commit_group()
+                    
+                    # Wait for at most 1 TMA in flight (pipelining!)
+                    # This allows the previous TMA to complete while we process the next tile
+                    cute.arch.cp_async_bulk_wait_group(1, read=True)
+                
+                cute.arch.barrier()
+                
+                # Alternate stage for next iteration
+                stage_idx = 1 - stage_idx
+        
+        # Wait for all remaining TMA stores to complete
+        if warp_idx == 0:
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+        cute.arch.barrier()
 
-    acc_full.release()
-    # Deallocate TMEM
+        acc_full.release()
+        
+        #
+        # Advance to next tile in persistent loop
+        #
+        tile_sched.advance_to_next_work()
+        work_tile = tile_sched.get_current_work()
+    
+    # After tile loop: cleanup
     cute.arch.barrier()
     tmem.free(acc_tmem_ptr)
     return
@@ -958,11 +977,26 @@ def my_kernel(
         a_copy_size + b_copy_size * 2 + sfa_copy_size + sfb_copy_size * 2
     ) * atom_thr_size
 
-    # Compute grid size
-    grid = (
+    # Compute grid size using persistent tile scheduler
+    # Number of CTA tiles in (M, N, L) dimensions
+    problem_shape_ntile_mnl = (
         cute.ceil_div(c_tensor.shape[0], mma_tiler_mnk[0]),
         cute.ceil_div(c_tensor.shape[1], mma_tiler_mnk[1]),
         c_tensor.shape[2],
+    )
+    cluster_shape_mnk = (1, 1, 1)  # Single CTA cluster for now
+    
+    # Create tile scheduler params
+    tile_sched_params = utils.PersistentTileSchedulerParams(
+        problem_shape_ntile_mnl,
+        cluster_shape_mnk,
+    )
+    
+    max_active_clusters = 148
+    
+    # Compute grid using persistent scheduler
+    grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+        tile_sched_params, max_active_clusters
     )
 
     # Launch the kernel.
@@ -1006,6 +1040,7 @@ def my_kernel(
         c_smem_layout_staged,       # Staged shared memory layout for C epilogue
         epi_tile,                   # Epilogue tile for partitioning
         c_layout,                   # Layout enum for C tensor
+        tile_sched_params,          # Persistent tile scheduler params
         
         # Pipeline synchronization parameter
         num_tma_load_bytes,         # Total bytes to load per TMA transaction (for barrier setup)
