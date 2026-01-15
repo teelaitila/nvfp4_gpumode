@@ -32,12 +32,13 @@ sf_vec_size = 16
 threads_per_cta = 128  
 # Stage numbers of shared memory and tmem
 num_acc_stage = 1
-num_ab_stage = 2  # Increased for better pipelining with warp specialization
+num_ab_stage = 3  # Increased from 2 to hide more memory latency
 num_c_stage = 2   # Overlap R2S writes with TMA S2G stores
 # Total number of columns in tmem
 num_tmem_alloc_cols = 512
 
 # TMA Prefetch distance (how many tiles ahead to prefetch)
+# Match num_ab_stage for optimal pipeline utilization
 prefetch_dist = num_ab_stage
 
 # Warp specialization IDs
@@ -80,7 +81,7 @@ def kernel(
     * (1.0 / (1.0 + cute.math.exp(-x, fastmath=True))),
 ):
     """
-    GPU device kernel performing the batched GEMM computation.
+    GPU device kernel performing the dual GEMM computation with silu activation.
     """
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -491,9 +492,13 @@ def kernel(
             cute.prefetch(tma_atom_sfb1, tBgSFB1[((0, None), pf_k_tile)])
             cute.prefetch(tma_atom_sfb2, tBgSFB2[((0, None), pf_k_tile)])
         
-        for k_tile in range(k_tile_cnt):
-            # Acquire empty buffer slot
-            ab_empty = ab_producer.acquire_and_advance()
+        # Reset producer state and peek for first iteration
+        ab_producer.reset()
+        peek_ab_empty_status = ab_producer.try_acquire()
+        
+        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            # Conditionally acquire empty buffer slot (non-blocking if peek succeeded)
+            ab_empty = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
             # TMA load A/B1/B2/SFA/SFB1/SFB2 to shared memory
             cute.copy(
@@ -542,6 +547,14 @@ def kernel(
                 cute.prefetch(tma_atom_sfa, tAgSFA[((0, None), future_k_tile)])
                 cute.prefetch(tma_atom_sfb1, tBgSFB1[((0, None), future_k_tile)])
                 cute.prefetch(tma_atom_sfb2, tBgSFB2[((0, None), future_k_tile)])
+            
+            # Peek for next iteration (non-blocking check if buffer is available)
+            peek_ab_empty_status = cutlass.Boolean(1)
+            if ab_empty.count + 1 < k_tile_cnt:
+                peek_ab_empty_status = ab_producer.try_acquire()
+        
+        # Wait for all TMA loads to complete (producer tail)
+        ab_producer.tail()
 
     # MMA Warp: handles all computation
     if warp_idx == mma_warp_id:
@@ -550,9 +563,13 @@ def kernel(
         # Set ACCUMULATE field to False for the first k_tile iteration
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         
-        for k_tile in range(k_tile_cnt):
-            # Wait for TMA data to be ready
-            ab_full = ab_consumer.wait_and_advance()
+        # Reset consumer state and peek for first iteration (non-blocking)
+        ab_consumer.reset()
+        peek_ab_full_status = ab_consumer.try_wait()
+        
+        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            # Conditionally wait for TMA data (non-blocking if peek succeeded)
+            ab_full = ab_consumer.wait_and_advance(peek_ab_full_status)
 
             # Copy SFA/SFB1/SFB2 to tmem
             s2t_stage_coord = (None, None, None, None, ab_full.index)
@@ -621,6 +638,11 @@ def kernel(
 
             # Signal TMA warp that this buffer slot is free
             ab_full.release()
+            
+            # Peek for next iteration (non-blocking check if data is ready)
+            peek_ab_full_status = cutlass.Boolean(1)
+            if ab_full.count + 1 < k_tile_cnt:
+                peek_ab_full_status = ab_consumer.try_wait()
         
         # Commit accumulator to epilogue
         acc_empty.commit()
