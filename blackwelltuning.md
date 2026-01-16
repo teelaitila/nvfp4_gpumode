@@ -18,3 +18,12 @@ Distributed Shared Memory can be used by an SM simultaneously with L2 cache acce
 In order to achieve best performance for accesses to Distributed Shared Memory, access patterns to those described in the CUDA C++ Best Practices Guide for Global Memory should be used. Specifically, accesses to Distributed Shared Memory should be coalesced and aligned to 32-byte segments, if possible. Access patterns with non-unit stride should be avoided if possible, which can be achieved by using local shared memory, similar to what is shown in the CUDA C++ Best Practices Guide for Shared Memory.
 
 The maximum portable cluster size supported is 8; however, NVIDIA Blackwell B200 GPU allows for a nonportable cluster size of 16 by opting in. Launching a kernel with a nonportable cluster size requires setting the cudaFuncAttributeNonPortableClusterSizeAllowed function attribute. Using larger cluster sizes may reduce the maximum number of active blocks across the GPU (refer to Occupancy).
+
+for gemvkernel not necessarily all applicable to bigger shapes:
+since the solutions are public, i can share some thoughts from my solution
+i tried ld.global, cp.async, and cp.async.bulk, but the more sophisticated ones are not faster (didn't test cp.async.bulk.tensor much)
+one of the most important tricks is cache modifier. use .cs / .L2::evict_last / .L1::no_allocate for A. that rules out cp.async since there is a PTX/SASS bug (illegal instruction encountered) on B200 when using cp.async with cache policy.
+from my testing, the naive ld.global is still the fastest
+other useful tricks: use fp16x2 math (since PTX only supports E2M1->FP16). I think a lot of ppl got this. there is also fma.rn.fp32.fp16 that can do FP16 FMA w/ FP32 accumulation on B200. B200 also has ld.global.v8.b32 (256-bit load per thread)
+overall, this problem requires high occupancy i.e. an SM runs multiple threadblocks at the same time -> issue a lot of loads to saturate the mem BW. this requires some care around register usage. i noticed @sam had -maxrregcount=32 but i didn't have much luck trying to tune this value lol
+I think this is also why things like cp.async.bulk / pipelining / persistent kernel don't really help much
