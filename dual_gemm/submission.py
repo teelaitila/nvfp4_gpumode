@@ -8,6 +8,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -36,6 +37,9 @@ num_ab_stage = 3  # More stages to better hide TMA latency for large K dimension
 num_c_stage = 2   # Overlap R2S writes with TMA S2G stores
 # Total number of columns in tmem
 num_tmem_alloc_cols = 512
+
+# Cluster shape for TMA multicast (M, N)
+cluster_shape_mn = (1, 4)
 
 # TMA Prefetch distance (how many tiles ahead to prefetch)
 # Match num_ab_stage for optimal pipeline utilization
@@ -69,6 +73,7 @@ def kernel(
     mSFB_nkl2: cute.Tensor,
     tma_atom_c: cute.CopyAtom,  # TMA S2G atom for C
     mC_mnl: cute.Tensor,  # TMA tensor for C store (for global coords)
+    cluster_layout_vmnk: cute.Layout,
     a_smem_layout_staged: cute.ComposedLayout,
     b_smem_layout_staged: cute.ComposedLayout,
     sfa_smem_layout_staged: cute.Layout,
@@ -93,6 +98,13 @@ def kernel(
     # Coords inside cluster
     bidx, bidy, bidz = cute.arch.block_idx()
     mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
+    is_leader_cta = mma_tile_coord_v == 0
+    cta_rank_in_cluster = cute.arch.make_warp_uniform(
+        cute.arch.block_idx_in_cluster()
+    )
+    block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+        cta_rank_in_cluster
+    )
 
     # Coords outside cluster
     cta_coord = (bidx, bidy, bidz)
@@ -166,15 +178,24 @@ def kernel(
     # Initialize mainloop ab_pipeline, acc_pipeline and their states
     #
     ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-    ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
-    ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+    num_mcast_ctas_a = cluster_shape_mn[1] if cluster_shape_mn[1] > 1 else 1
+    num_mcast_ctas_b = 1
+    num_tma_producer = num_mcast_ctas_a + num_mcast_ctas_b - 1
+    ab_pipeline_consumer_group = pipeline.CooperativeGroup(
+        pipeline.Agent.Thread, num_tma_producer
+    )
+    ab_pipeline = pipeline.PipelineTmaUmma.create(
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
         num_stages=num_ab_stage,
         producer_group=ab_pipeline_producer_group,
         consumer_group=ab_pipeline_consumer_group,
         tx_count=num_tma_load_bytes,
-    ).make_participants()
-    acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
+        cta_layout_vmnk=cluster_layout_vmnk,
+        mcast_mode_mn=(1, cluster_shape_mn[1]),
+        defer_sync=True,
+    )
+    ab_producer, ab_consumer = ab_pipeline.make_participants()
+    acc_pipeline = pipeline.PipelineUmmaAsync.create(
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         num_stages=num_acc_stage,
         producer_group=ab_pipeline_producer_group,
@@ -182,7 +203,15 @@ def kernel(
             pipeline.Agent.Thread,
             threads_per_cta,
         ),
-    ).make_participants()
+        cta_layout_vmnk=cluster_layout_vmnk,
+        defer_sync=True,
+    )
+    acc_producer, acc_consumer = acc_pipeline.make_participants()
+
+    # Cluster arrive after barrier init
+    if cutlass.const_expr(cluster_shape_mn[1] > 1):
+        pipeline_init_arrive(cluster_shape_mn=cluster_shape_mn, is_relaxed=True)
+        pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
     
     # C store pipeline for TMA S2G
     c_producer_group = pipeline.CooperativeGroup(
@@ -248,23 +277,25 @@ def kernel(
     #
     # Partition global/shared tensor for TMA load A/B/SFA/SFB
     #
-    # TMA Partition_S/D for A
+    # TMA Partition_S/D for A (cluster multicast across N)
+    a_cta_layout = cute.make_layout(cute.size(cluster_layout_vmnk, mode=[2]))
     # ((atom_v, rest_v), STAGE)
     # ((atom_v, rest_v), RestM, RestK, RestL)
     tAsA, tAgA = cpasync.tma_partition(
         tma_atom_a,
-        0,
-        cute.make_layout(1),
+        block_in_cluster_coord_vmnk[2],
+        a_cta_layout,
         cute.group_modes(sA, 0, 3),
         cute.group_modes(tCgA, 0, 3),
     )
     # TMA Partition_S/D for B1
+    b_cta_layout = cute.make_layout(cute.size(cluster_layout_vmnk, mode=[1]))
     # ((atom_v, rest_v), STAGE)
     # ((atom_v, rest_v), RestN, RestK, RestL)
     tBsB1, tBgB1 = cpasync.tma_partition(
         tma_atom_b1,
-        0,
-        cute.make_layout(1),
+        block_in_cluster_coord_vmnk[1],
+        b_cta_layout,
         cute.group_modes(sB1, 0, 3),
         cute.group_modes(tCgB1, 0, 3),
     )
@@ -273,8 +304,8 @@ def kernel(
     # ((atom_v, rest_v), RestN, RestK, RestL)
     tBsB2, tBgB2 = cpasync.tma_partition(
         tma_atom_b2,
-        0,
-        cute.make_layout(1),
+        block_in_cluster_coord_vmnk[1],
+        b_cta_layout,
         cute.group_modes(sB2, 0, 3),
         cute.group_modes(tCgB2, 0, 3),
     )
@@ -283,8 +314,8 @@ def kernel(
     # ((atom_v, rest_v), RestM, RestK, RestL)
     tAsSFA, tAgSFA = cpasync.tma_partition(
         tma_atom_sfa,
-        0,
-        cute.make_layout(1),
+        block_in_cluster_coord_vmnk[2],
+        a_cta_layout,
         cute.group_modes(sSFA, 0, 3),
         cute.group_modes(tCgSFA, 0, 3),
     )
@@ -295,8 +326,8 @@ def kernel(
     # ((atom_v, rest_v), RestN, RestK, RestL)
     tBsSFB1, tBgSFB1 = cpasync.tma_partition(
         tma_atom_sfb1,
-        0,
-        cute.make_layout(1),
+        block_in_cluster_coord_vmnk[1],
+        b_cta_layout,
         cute.group_modes(sSFB1, 0, 3),
         cute.group_modes(tCgSFB1, 0, 3),
     )
@@ -307,13 +338,26 @@ def kernel(
     # ((atom_v, rest_v), RestN, RestK, RestL)
     tBsSFB2, tBgSFB2 = cpasync.tma_partition(
         tma_atom_sfb2,
-        0,
-        cute.make_layout(1),
+        block_in_cluster_coord_vmnk[1],
+        b_cta_layout,
         cute.group_modes(sSFB2, 0, 3),
         cute.group_modes(tCgSFB2, 0, 3),
     )
     tBsSFB2 = cute.filter_zeros(tBsSFB2)
     tBgSFB2 = cute.filter_zeros(tBgSFB2)
+
+    #
+    # Multicast masks (A/SFA only) across N dimension
+    #
+    a_full_mcast_mask = None
+    sfa_full_mcast_mask = None
+    if cutlass.const_expr(cluster_shape_mn[1] > 1):
+        a_full_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+        )
+        sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+        )
 
     #
     # Partition shared/tensor memory tensor for TiledMMA_A/B/C
@@ -481,7 +525,6 @@ def kernel(
         cpasync.prefetch_descriptor(tma_atom_sfa)
         cpasync.prefetch_descriptor(tma_atom_sfb1)
         cpasync.prefetch_descriptor(tma_atom_sfb2)
-        cpasync.prefetch_descriptor(tma_atom_c)
         
         # Initial prefetch: prime the pipeline with first prefetch_dist tiles
         for pf_k_tile in cutlass.range(0, min(prefetch_dist, k_tile_cnt), unroll=4):
@@ -506,6 +549,7 @@ def kernel(
                 tAgA[(None, ab_empty.count)],
                 tAsA[(None, ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
+                mcast_mask=a_full_mcast_mask,
             )
             cute.copy(
                 tma_atom_b1,
@@ -524,6 +568,7 @@ def kernel(
                 tAgSFA[((0, None), ab_empty.count)],
                 tAsSFA[((0, None), ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
+                mcast_mask=sfa_full_mcast_mask,
             )
             cute.copy(
                 tma_atom_sfb1,
@@ -557,7 +602,7 @@ def kernel(
         ab_producer.tail()
 
     # MMA Warp: handles all computation
-    if warp_idx == mma_warp_id:
+    if warp_idx == mma_warp_id and is_leader_cta:
         # Acquire accumulator buffer
         acc_empty = acc_producer.acquire_and_advance()
         # Set ACCUMULATE field to False for the first k_tile iteration
@@ -872,8 +917,8 @@ def my_kernel(
     )
     tiled_mma = cute.make_tiled_mma(mma_op)
 
-    cluster_layout_vmnk  = cute.tiled_divide(
-        cute.make_layout((1, 1, 1)),
+    cluster_layout_vmnk = cute.tiled_divide(
+        cute.make_layout((*cluster_shape_mn, 1)),
         (tiled_mma.thr_id.shape,),
     )
 
@@ -927,10 +972,13 @@ def my_kernel(
         num_c_stage,
     )
 
-    # Setup TMA for A
+    # Setup TMA for A (cluster-aware atom for multicast)
     a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, None, 0))
+    a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+        cluster_shape_mn, tiled_mma.thr_id
+    )
     tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-        cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+        a_op,
         a_tensor,
         a_smem_layout,
         mma_tiler_mnk,
@@ -939,8 +987,11 @@ def my_kernel(
     )
     # Setup TMA for B1
     b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, None, 0))
+    b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+        cluster_shape_mn, tiled_mma.thr_id
+    )
     tma_atom_b1, tma_tensor_b1 = cute.nvgpu.make_tiled_tma_atom_B(
-        cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+        b_op,
         b_tensor1,
         b_smem_layout,
         mma_tiler_mnk,
@@ -949,7 +1000,7 @@ def my_kernel(
     )
     # Setup TMA for B2
     tma_atom_b2, tma_tensor_b2 = cute.nvgpu.make_tiled_tma_atom_B(
-        cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+        b_op,
         b_tensor2,
         b_smem_layout,
         mma_tiler_mnk,
@@ -960,8 +1011,11 @@ def my_kernel(
     sfa_smem_layout = cute.slice_(
         sfa_smem_layout_staged , (None, None, None, 0)
     )
+    sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
+        cluster_shape_mn, tiled_mma.thr_id
+    )
     tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
-        cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+        sfa_op,
         sfa_tensor,
         sfa_smem_layout,
         mma_tiler_mnk,
@@ -973,8 +1027,11 @@ def my_kernel(
     sfb_smem_layout = cute.slice_(
         sfb_smem_layout_staged , (None, None, None, 0)
     )
+    sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
+        cluster_shape_mn, tiled_mma.thr_id
+    )
     tma_atom_sfb1, tma_tensor_sfb1 = cute.nvgpu.make_tiled_tma_atom_B(
-        cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+        sfb_op,
         sfb_tensor1,
         sfb_smem_layout,
         mma_tiler_mnk,
@@ -984,7 +1041,7 @@ def my_kernel(
     )
     # Setup TMA for SFB2
     tma_atom_sfb2, tma_tensor_sfb2 = cute.nvgpu.make_tiled_tma_atom_B(
-        cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+        sfb_op,
         sfb_tensor2,
         sfb_smem_layout,
         mma_tiler_mnk,
@@ -1018,6 +1075,7 @@ def my_kernel(
         cute.ceil_div(c_tensor.shape[1], mma_tiler_mnk[1]),
         c_tensor.shape[2],
     )
+    grid = cute.round_up(grid, (*cluster_shape_mn, 1))
 
     # Launch the kernel.
     kernel(
@@ -1051,6 +1109,7 @@ def my_kernel(
         # TMA atom for C store (S2G)
         tma_atom_c,                 # TMA copy atom for storing C from shared to global memory
         tma_tensor_c,               # TMA tensor for C store
+        cluster_layout_vmnk,        # Cluster layout for multicast
         
         # Shared memory layouts with staging for pipelined execution
         a_smem_layout_staged,       # Staged shared memory layout for A (includes stage dimension)
@@ -1069,7 +1128,7 @@ def my_kernel(
     ).launch(
         grid=grid,
         block=[threads_per_cta, 1, 1],
-        cluster=(1, 1, 1),
+        cluster=(*cluster_shape_mn, 1),
     )
     return
 
