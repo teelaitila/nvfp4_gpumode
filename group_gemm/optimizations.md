@@ -1,7 +1,3 @@
-
-1. Multi-Stage Pipelining
-# dualgemmex: dynamically computes optimal stages based on SMEMnum_ab_stage = (smem_capacity // occupancy - ...) // ab_bytes_per_stage# Our kernel: hardcoded single stagenum_ab_stage = 1
-Multi-stage allows TMA to prefetch while MMA computes, hiding memory latency.
 2. TMA Cache Policy Hints
 # dualgemmex:cute.copy(..., cache_policy=cutlass.Int64(self.cache_policy))# Uses _TMA_CACHE_EVICT_FIRST = 0x12F0000000000000# Our kernel: no cache policy
 3. TMA Store for Epilogue
