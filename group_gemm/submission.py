@@ -287,8 +287,8 @@ class GroupGemm:
         ptr_of_tensor_of_sfasfb_ptrs: cute.Pointer,
         ptr_of_tensor_of_tensormap: cute.Pointer,
         total_num_clusters: cutlass.Int32,
-        problem_sizes: List[Tuple[int, int, int, int]],
-        num_groups: cutlass.Int32,
+        problem_sizes: cutlass.Constexpr[List[Tuple[int, int, int, int]]],
+        num_groups: cutlass.Constexpr[cutlass.Int32],
     ):
         """
         Host-side JIT entry point. Creates tensors, TMA atoms, and launches kernel.
@@ -439,11 +439,13 @@ class GroupGemm:
             self.epi_tile,
         )
         
-        # Store CTA shape information for each group
-        cta_mn_list = []
-        for group_idx, (m, n, k, l) in enumerate(problem_sizes):
+        # Store CTA shape information for each group (constexpr lists)
+        cta_m_list = []
+        cta_n_list = []
+        for group_idx in cutlass.range_constexpr(num_groups):
             x, y = cute.ceil_div(problem_sizes[group_idx][:2], self.mma_tiler_mnk[0:2])
-            cta_mn_list.append((x, y))
+            cta_m_list.append(x)
+            cta_n_list.append(y)
         
         # Compute grid size
         grid = (1, 1, total_num_clusters)
@@ -474,9 +476,11 @@ class GroupGemm:
             self.sfb_smem_layout_staged,
             self.c_smem_layout_staged,
             self.epi_tile,
-            cta_mn_list,
+            cta_m_list,
+            cta_n_list,
             num_tma_load_bytes,
             self.num_ab_stage,
+            num_groups,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -510,9 +514,11 @@ class GroupGemm:
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
-        cta_mn_list: List[Tuple[int, int]],
+        cta_m_list: cutlass.Constexpr[List[int]],
+        cta_n_list: cutlass.Constexpr[List[int]],
         num_tma_load_bytes: cutlass.Constexpr[int],
         num_ab_stage: cutlass.Constexpr[int],
+        num_groups: cutlass.Constexpr[cutlass.Int32],
     ):
         """
         Device-side kernel performing the Group GEMM computation.
@@ -533,7 +539,9 @@ class GroupGemm:
         coord_x = 0
         coord_y = 0
         cta_rest = bidz
-        for _, (cta_m, cta_n) in enumerate(cta_mn_list):
+        for g in cutlass.range_constexpr(num_groups):
+            cta_m = cta_m_list[g]
+            cta_n = cta_n_list[g]
             if cta_rest >= (cta_m * cta_n):
                 group_idx += 1
                 cta_rest -= cta_m * cta_n
@@ -1175,9 +1183,11 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     # Look up config for this problem
     config = get_config(num_groups, n, k)
     
-    # Cache key includes config to allow different compilations
+    # Cache key includes config AND problem_sizes (since problem_sizes is Constexpr)
+    problem_sizes_tuple = tuple(tuple(ps) for ps in problem_sizes)
     cache_key = (num_groups, config["tile_mn"], config["cluster_mn"], 
-                 config["occupancy"], config["cache_policy"], config["num_ab_stage"])
+                 config["occupancy"], config["cache_policy"], config["num_ab_stage"],
+                 problem_sizes_tuple)
     
     if cache_key in _compiled_kernel_cache:
         return _compiled_kernel_cache[cache_key]
@@ -1214,7 +1224,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
         cute_ptr_of_tensor_of_tensormap,
         total_num_clusters,
         problem_sizes,
-        num_groups,
+        cutlass.Int32(num_groups),
     )
     
     _compiled_kernel_cache[cache_key] = compiled_func
@@ -1288,8 +1298,6 @@ def custom_kernel(data: input_t) -> output_t:
         cute_ptr_of_tensor_of_sfasfb_ptrs,
         cute_ptr_of_tensor_of_tensormap,
         total_num_clusters,
-        problem_sizes,
-        num_groups,
     )
 
     res = []
