@@ -27,6 +27,9 @@ Changed from per-CTA to per-GROUP tensormap allocation. Reduces memory and allow
 ### 7. Constexpr Group Shapes
 Moved CTA shape list construction into the JIT path using `cutlass.range_constexpr` and passed `problem_sizes`/`num_groups` as `Constexpr`.
 
+### 8. ACC + C Pipeline Staging
+Added accumulator staging (`num_acc_stage`) and epilogue C staging (`num_c_stage`) to better overlap compute and TMA stores. Initially set to 2 stages each.
+
 ---
 
 ## Gap Analysis: Speed of Light
@@ -81,3 +84,13 @@ benchmarks:
 | 2 | 129 µs | -67% | 3.01x |
 | 3 | 90.5 µs | -46% | 1.86x |
 | 4 | 91.0 µs | -41% | 1.69x |
+
+**Current (B200, 2026-01-28, acc=1, c=1):**
+| Case | Time | Δ vs Baseline | Speedup vs Baseline |
+|------|------|---------------|---------------------|
+| 1 | 137 µs | -58% | 2.38x |
+| 2 | 138 µs | -64% | 2.81x |
+| 3 | 87.9 µs | -48% | 1.91x |
+| 4 | 84.2 µs | -45% | 1.83x |
+
+TODO: Tinker with stages per benchmark case (AB/C/ACC) and re-measure.

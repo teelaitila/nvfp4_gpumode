@@ -165,7 +165,8 @@ class GroupGemm:
         self.threads_per_cta = 32 * 6  # 6 warps
         
         # Pipeline stages
-        self.num_acc_stage = 1
+        self.num_acc_stage = 2
+        self.num_c_stage = 2
         
         # SMEM capacity for B200 (SM100) - 228KB
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
@@ -235,11 +236,12 @@ class GroupGemm:
             self.c_dtype,
         )
         
-        # Compute optimal pipeline stages (use fixed if specified, else dynamic)
+        # Compute optimal pipeline stages (use fixed AB if specified, else dynamic)
         if self.fixed_num_ab_stage is not None:
             self.num_ab_stage = self.fixed_num_ab_stage
+            _, self.num_c_stage = self._compute_stages(tiled_mma)
         else:
-            self.num_ab_stage = self._compute_num_ab_stages(tiled_mma)
+            self.num_ab_stage, self.num_c_stage = self._compute_stages(tiled_mma)
         
         # SMEM layouts
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -255,13 +257,13 @@ class GroupGemm:
             tiled_mma, self.mma_tiler_mnk, self.sf_vec_size, self.num_ab_stage
         )
         self.c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.c_dtype, self.c_layout, self.epi_tile, 1
+            self.c_dtype, self.c_layout, self.epi_tile, self.num_c_stage
         )
         
         return tiled_mma, tiled_mma_sfb
 
-    def _compute_num_ab_stages(self, tiled_mma: cute.TiledMma) -> int:
-        """Compute optimal number of A/B pipeline stages based on SMEM capacity."""
+    def _compute_stages(self, tiled_mma: cute.TiledMma) -> Tuple[int, int]:
+        """Compute optimal number of A/B and epilogue (C) stages based on SMEM capacity."""
         # Compute SMEM size for single stage of each buffer
         a_smem_layout_one = sm100_utils.make_smem_layout_a(
             tiled_mma, self.mma_tiler_mnk, self.ab_dtype, 1
@@ -289,14 +291,28 @@ class GroupGemm:
         
         # Fixed overhead
         mbar_helpers_bytes = 2048
-        c_bytes = cute.size_in_bytes(self.c_dtype, c_smem_layout_one)
+        c_bytes_per_stage = cute.size_in_bytes(self.c_dtype, c_smem_layout_one)
+        num_c_stage = 2
+        c_bytes = c_bytes_per_stage * num_c_stage
         
-        # Compute max AB stages that fit
-        available_for_ab = self.smem_capacity // self.occupancy - mbar_helpers_bytes - c_bytes
+        # Compute max AB stages that fit after reserving base C stages
+        available_for_ab = (
+            self.smem_capacity // self.occupancy - mbar_helpers_bytes - c_bytes
+        )
         num_ab_stage = max(1, available_for_ab // ab_bytes_per_stage)
         
-        # Cap at reasonable maximum
-        return min(num_ab_stage, 8)
+        # Add leftover SMEM to epilogue stages (at least 2)
+        leftover = (
+            self.smem_capacity // self.occupancy
+            - mbar_helpers_bytes
+            - num_ab_stage * ab_bytes_per_stage
+            - c_bytes
+        )
+        if leftover > 0:
+            num_c_stage += leftover // c_bytes_per_stage
+
+        # Cap at reasonable maximum for AB stages
+        return min(num_ab_stage, 8), max(2, num_c_stage)
 
     @cute.jit
     def __call__(
@@ -865,7 +881,9 @@ class GroupGemm:
         tCrA = tiled_mma.make_fragment_A(sA)
         tCrB = tiled_mma.make_fragment_B(sB)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler_mnk[:2])
-        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+        tCtAcc_fake = tiled_mma.make_fragment_C(
+            cute.append(acc_shape, self.num_acc_stage)
+        )
 
         pipeline_init_wait(cluster_shape_mn=(1, 1))
 
@@ -952,9 +970,9 @@ class GroupGemm:
         elif warp_idx == self.mma_warp_id:
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
-            tCtAcc = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
+            tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
             sfa_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc),
+                acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
                 dtype=self.sf_dtype,
             )
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -966,7 +984,7 @@ class GroupGemm:
             tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
             sfb_tmem_ptr = cute.recast_ptr(
                 acc_tmem_ptr
-                + tcgen05.find_tmem_tensor_col_offset(tCtAcc)
+                + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
                 + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
                 dtype=self.sf_dtype,
             )
@@ -997,12 +1015,15 @@ class GroupGemm:
                 offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                 shifted_ptr = cute.recast_ptr(
                     acc_tmem_ptr
-                    + tcgen05.find_tmem_tensor_col_offset(tCtAcc)
+                    + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
                     + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
                     + offset,
                     dtype=self.sf_dtype,
                 )
                 tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+
+            acc_pipeline.producer_acquire(acc_producer_state)
+            tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for _ in range(k_block_cnt):
@@ -1023,15 +1044,33 @@ class GroupGemm:
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
             acc_pipeline.producer_commit(acc_producer_state)
+            acc_producer_state.advance()
 
         # Epilogue warps: Store results via TMA
         elif warp_idx in self.epilog_warp_id:
             tmem.allocate(self.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
-            tCtAcc = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
+            tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
             
-            # Setup epilogue copies
+            # TMA store pipeline
+            c_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32 * len(self.epilog_warp_id),
+            )
+            c_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=self.num_c_stage, producer_group=c_producer_group,
+            )
+            
+            if warp_idx == self.epilog_warp_id[0]:
+                tensormap_manager.fence_tensormap_update(tensormap_c_gmem_ptr)
+            
+            acc_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_acc_stage
+            )
+            acc_pipeline.consumer_wait(acc_consumer_state)
+            tCtAcc = tCtAcc_base[(None, None, None, acc_consumer_state.index)]
+
+            # Setup epilogue copies (after selecting acc stage)
             tiled_copy_t2r, tTR_tAcc, tTR_rAcc = self.epilog_tmem_copy_and_partition(
                 tidx, tCtAcc, tCgC, epi_tile
             )
@@ -1044,22 +1083,6 @@ class GroupGemm:
             _, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(
                 tma_atom_c, tCgC, epi_tile, sC
             )
-            
-            # TMA store pipeline
-            c_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, 32 * len(self.epilog_warp_id),
-            )
-            c_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=1, producer_group=c_producer_group,
-            )
-            
-            if warp_idx == self.epilog_warp_id[0]:
-                tensormap_manager.fence_tensormap_update(tensormap_c_gmem_ptr)
-            
-            acc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_acc_stage
-            )
-            acc_pipeline.consumer_wait(acc_consumer_state)
             
             bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
             tTR_tAcc_tile = tTR_tAcc[(None, None, None, None, None)]
@@ -1074,7 +1097,12 @@ class GroupGemm:
                 acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                 tRS_rC.store(acc_vec.to(self.c_dtype))
                 
-                cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, 0)])
+                c_buffer = subtile_idx % self.num_c_stage
+                cute.copy(
+                    tiled_copy_r2s,
+                    tRS_rC,
+                    tRS_sC[(None, None, None, c_buffer)],
+                )
                 
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared,
@@ -1085,7 +1113,7 @@ class GroupGemm:
                 if warp_idx == self.epilog_warp_id[0]:
                     cute.copy(
                         tma_atom_c,
-                        bSG_sC[(None, 0)],
+                        bSG_sC[(None, c_buffer)],
                         bSG_gC_grouped[(None, subtile_idx)],
                         tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
                             tensormap_c_gmem_ptr, cute.AddressSpace.generic,
@@ -1097,6 +1125,7 @@ class GroupGemm:
             
             with cute.arch.elect_one():
                 acc_pipeline.consumer_release(acc_consumer_state)
+                acc_consumer_state.advance()
             
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
@@ -1232,7 +1261,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
         cache_policy=config["cache_policy"],
         num_ab_stage=config["num_ab_stage"],
     )
-    compiled_func = cute.compile(
+    compiled_func = cute.compile[cute.GenerateLineInfo(True)](
         gemm,
         cute_ptr_of_tensor_of_problem_sizes,
         cute_ptr_of_tensor_of_abc_ptrs,
