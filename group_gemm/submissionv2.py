@@ -1,38 +1,29 @@
-# Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+import subprocess
+import sys
 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
 
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
+def install_package():
+    """Install apache-tvm-ffi using pip"""
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "apache-tvm-ffi"]
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error installing package: {e}")
+        return False
 
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
 
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
+install_package()
 
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+from task import input_t, output_t
 
-import argparse
+
 import functools
 from typing import List, Type, Tuple, Union
 from inspect import isclass
 
 import torch
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
@@ -43,7 +34,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_ptr
 
 """
 This example provides an experimental implementation of the SM100 grouped blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
@@ -57,33 +48,6 @@ in global memory are passed to the kernel in an array (also held in global memor
 strides are also stored in arrays in GMEM.
 
 This differs from "Batched Array" GEMM since the size of each GEMM problem in the grouped GEMM concept may be distinct.
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/blackwell/grouped_blockscaled_gemm.py                                     \
-      --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 16                       \
-      --c_dtype Float16                                                                       \
-      --mma_tiler_mn 128,128 --cluster_shape_mn 1,1                                           \
-      --problem_sizes_mnkl "(8192,1280,32,1),(32,384,1536,1),(640,1280,32,1),(640,160,32,1)"  \
-      --num_groups 4
-
-The above example command makes 4 groups of different m, n, k sizes. The Blackwell tcgen05 MMA tile shape
-is specified as (128, 64) and the cluster shape is (1,1). The input, mma accumulator and output data type
-are set as fp16, fp32 and fp16, respectively.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/grouped_blockscaled_gemm.py                                 \
-      --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 16                       \
-      --c_dtype Float16                                                                       \
-      --mma_tiler_mn 128,128 --cluster_shape_mn 1,1                                           \
-      --problem_sizes_mnkl "(8192,1280,32,1),(32,384,1536,1),(640,1280,32,1),(640,160,32,1)"  \
-      --num_groups 4
-      --warmup_iterations 1 --iterations 10 --skip_ref_check
 
 Constraints:
 * Supported input data types: mxf8, mxf4, nvf4
@@ -363,20 +327,14 @@ class Sm100GroupedBlockScaledGemmKernel:
     @cute.jit
     def __call__(
         self,
-        initial_a: cute.Tensor,
-        initial_b: cute.Tensor,
-        initial_c: cute.Tensor,
-        initial_sfa: cute.Tensor,
-        initial_sfb: cute.Tensor,
         group_count: cutlass.Constexpr[int],
-        problem_shape_mnkl: cute.Tensor,
-        strides_abc: cute.Tensor,
-        tensor_address_abc: cute.Tensor,
-        tensor_address_sfasfb: cute.Tensor,
-        total_num_clusters: cutlass.Constexpr[int],
-        tensormap_cute_tensor: cute.Tensor,
+        ptr_of_problem_sizes: cute.Pointer,
+        ptr_of_strides_abc: cute.Pointer,
+        ptr_of_ptrs_abc: cute.Pointer,
+        ptr_of_ptrs_sfasfb: cute.Pointer,
+        ptr_of_tensormap: cute.Pointer,
+        total_num_clusters: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr[int],
-        stream: cuda.CUstream,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -389,48 +347,103 @@ class Sm100GroupedBlockScaledGemmKernel:
         by different tensors in global memory. The "initial" tensors only carry data type and
         majorness information.
 
-        :param initial_a: Initial tensor A, used for data type and majorness information.
-        :type initial_a: cute.Tensor
-        :param initial_b: Initial tensor B, used for data type and majorness information.
-        :type initial_b: cute.Tensor
-        :param initial_c: Initial tensor C, used for data type and majorness information.
-        :type initial_c: cute.Tensor
-        :param initial_sfa: Initial tensor SFA, used for data type and majorness information.
-        :type initial_sfa: cute.Tensor
-        :param initial_sfb: Initial tensor SFB, used for data type and majorness information.
-        :type initial_sfb: cute.Tensor
         :param group_count: The number of GEMM groups.
         :type group_count: cutlass.Constexpr[int]
-        :param problem_shape_mnkl: Tensor containing the (M, N, K, L) shape for each group.
-        :type problem_shape_mnkl: cute.Tensor
-        :param strides_abc: Tensor containing the strides for A, B, and C for each group.
-        :type strides_abc: cute.Tensor
-        :param tensor_address_abc: Tensor containing the base addresses for A, B, and C for each group.
-        :type tensor_address_abc: cute.Tensor
-        :param tensor_address_sfasfb: Tensor containing the base addresses for SFA and SFB for each group.
-        :type tensor_address_sfasfb: cute.Tensor
+        :param ptr_of_problem_sizes: Pointer to (M, N, K, L) shape array for each group.
+        :type ptr_of_problem_sizes: cute.Pointer
+        :param ptr_of_strides_abc: Pointer to strides for A, B, C for each group.
+        :type ptr_of_strides_abc: cute.Pointer
+        :param ptr_of_ptrs_abc: Pointer to base addresses for A, B, C for each group.
+        :type ptr_of_ptrs_abc: cute.Pointer
+        :param ptr_of_ptrs_sfasfb: Pointer to base addresses for SFA and SFB for each group.
+        :type ptr_of_ptrs_sfasfb: cute.Pointer
+        :param ptr_of_tensormap: Pointer to tensormap storage.
+        :type ptr_of_tensormap: cute.Pointer
         :param total_num_clusters: Total number of clusters needed for all groups.
-        :type total_num_clusters: cutlass.Constexpr[int]
-        :param tensormap_cute_tensor: Tensor for storing tensormaps.
-        :type tensormap_cute_tensor: cute.Tensor
+        :type total_num_clusters: cutlass.Int32
         :param max_active_clusters: Maximum number of active clusters.
         :type max_active_clusters: cutlass.Constexpr[int]
-        :param stream: CUDA stream for asynchronous execution.
-        :type stream: cuda.CUstream
         :raises TypeError: If A and B data types do not match.
         """
-        self.a_dtype = initial_a.element_type
-        self.b_dtype = initial_b.element_type
-        self.sf_dtype = initial_sfa.element_type
-        self.c_dtype = initial_c.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(initial_a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(initial_b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(initial_c)
+        self.a_dtype = AB_DTYPE
+        self.b_dtype = AB_DTYPE
+        self.sf_dtype = SF_DTYPE
+        self.c_dtype = C_DTYPE
+        self.a_major_mode = tcgen05.OperandMajorMode.K
+        self.b_major_mode = tcgen05.OperandMajorMode.K
+        self.c_layout = utils.LayoutEnum.ROW_MAJOR
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
+
+        # Create metadata tensors from pointers
+        problem_shape_mnkl = cute.make_tensor(
+            ptr_of_problem_sizes,
+            cute.make_layout((group_count, 4), stride=(4, 1)),
+        )
+        strides_abc = cute.make_tensor(
+            ptr_of_strides_abc,
+            cute.make_layout((group_count, 3, 2), stride=(6, 2, 1)),
+        )
+        tensor_address_abc = cute.make_tensor(
+            ptr_of_ptrs_abc,
+            cute.make_layout((group_count, 3), stride=(3, 1)),
+        )
+        tensor_address_sfasfb = cute.make_tensor(
+            ptr_of_ptrs_sfasfb,
+            cute.make_layout((group_count, 2), stride=(2, 1)),
+        )
+        tensormap_cute_tensor = cute.make_tensor(
+            ptr_of_tensormap,
+            cute.make_layout(
+                (total_num_clusters, self.num_tensormaps, 16),
+                stride=(self.num_tensormaps * 16, 16, 1),
+            ),
+        )
+
+        # Create template tensors for TMA setup (max shapes)
+        max_m = cutlass.Int32(MAX_M)
+        max_n = cutlass.Int32(MAX_N)
+        max_k = cutlass.Int32(MAX_K)
+        c1 = cutlass.Int32(1)
+
+        initial_a = cute.make_tensor(
+            cute.make_ptr(self.a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (max_m, max_k, c1),
+                stride=(max_k, 1, max_m * max_k),
+            ),
+        )
+        initial_b = cute.make_tensor(
+            cute.make_ptr(self.b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (max_n, max_k, c1),
+                stride=(max_k, 1, max_n * max_k),
+            ),
+        )
+        initial_c = cute.make_tensor(
+            cute.make_ptr(self.c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (max_m, max_n, c1),
+                stride=(max_n, 1, max_m * max_n),
+            ),
+        )
+        initial_sfa = cute.make_tensor(
+            cute.make_ptr(self.sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (max_m, max_k, c1),
+                stride=(max_k, 1, max_m * max_k),
+            ),
+        )
+        initial_sfb = cute.make_tensor(
+            cute.make_ptr(self.sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (max_n, max_k, c1),
+                stride=(max_k, 1, max_n * max_k),
+            ),
+        )
 
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
@@ -642,7 +655,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             smem=self.shared_storage.size_in_bytes(),
-            stream=stream,
             min_blocks_per_mp=1,
         )
         return
@@ -691,8 +703,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_sfb)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
 
-        use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
-
         #
         # Setup cta/thread coordinates
         #
@@ -737,7 +747,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             + Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8
         )
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
         tmem_holding_buf = storage.tmem_holding_buf
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -757,9 +766,7 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (
-            2 if use_2cta_instrs else 1
-        )
+        num_acc_consumer_threads = len(self.epilog_warp_id)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -770,15 +777,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
         )
-
-        # Tensor memory dealloc barrier init
-        if use_2cta_instrs:
-            if warp_idx == self.tma_warp_id:
-                num_tmem_dealloc_threads = 32
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_init(
-                        tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads
-                    )
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -809,19 +807,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         b_full_mcast_mask = None
         sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
-        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
-            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-            )
-            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
-            )
-            sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-            )
-            sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1
-            )
+        # No multicast for cluster_shape_mn=(1,1); keep masks as None
 
         #
         # Local_tile partition global tensors
@@ -1440,7 +1426,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 cute.arch.alloc_tmem(
                     self.num_tmem_alloc_cols,
                     tmem_holding_buf,
-                    is_two_cta=use_2cta_instrs,
+                    is_two_cta=False,
                 )
 
             #
@@ -1466,7 +1452,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             epi_tidx = tidx
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
                 self.epilog_tmem_copy_and_partition(
-                    epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
+                    epi_tidx, tCtAcc_base, tCgC, epi_tile
                 )
             )
 
@@ -1648,16 +1634,11 @@ class Sm100GroupedBlockScaledGemmKernel:
             # Dealloc the tensor memory buffer
             #
             if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
+                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
             self.epilog_sync_barrier.arrive_and_wait()
             if warp_idx == self.epilog_warp_id[0]:
-                if use_2cta_instrs:
-                    cute.arch.mbarrier_arrive(
-                        tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1
-                    )
-                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
                 cute.arch.dealloc_tmem(
-                    acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
+                    acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=False
                 )
             #
             # Wait for C store complete
@@ -1851,7 +1832,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         tAcc: cute.Tensor,
         gC_mnl: cute.Tensor,
         epi_tile: cute.Tile,
-        use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
@@ -1864,9 +1844,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         :type gC_mnl: cute.Tensor
         :param epi_tile: The epilogue tiler
         :type epi_tile: cute.Tile
-        :param use_2cta_instrs: Whether use_2cta_instrs is enabled
-        :type use_2cta_instrs: bool
-
         :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
             - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
             - tTR_tAcc: The partitioned accumulator tensor
@@ -1880,7 +1857,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             self.c_dtype,
             self.acc_dtype,
             epi_tile,
-            use_2cta_instrs,
+            False,
         )
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
         tAcc_epi = cute.flat_divide(
@@ -2413,801 +2390,186 @@ class Sm100GroupedBlockScaledGemmKernel:
     tensor_memory_management_bytes = 12
 
 
-# Create tensor and return the pointer, tensor, and stride
-def create_tensor_and_stride(
-    l: int,
-    mode0: int,
-    mode1: int,
-    is_mode0_major: bool,
-    dtype: type[cutlass.Numeric],
-    is_dynamic_layout: bool = True,
-) -> tuple[int, torch.Tensor, cute.Tensor, torch.Tensor, tuple[int, int]]:
-    """Create GPU tensor from either a new or existing CPU tensor.
+# =============================================================================
+# Fixed kernel configuration defaults (NVF4 block-scaled GEMM)
+# =============================================================================
+SF_VEC_SIZE = 16  # Scale factor vector size for NVF4
+MMA_TILER_MN = (128, 128)  # MMA tile shape (M, N)
+CLUSTER_SHAPE_MN = (1, 1)  # Cluster shape (M, N)
+AB_DTYPE = cutlass.Float4E2M1FN
+SF_DTYPE = cutlass.Float8E4M3FN  # float8_e4m3fnuz for NVF4
+C_DTYPE = cutlass.Float16
+MAX_M = 512
+MAX_N = 7168
+MAX_K = 7168
 
-    :param torch_tensor_cpu: Optional existing CPU tensor to reuse. If None, creates a new one.
-    :type torch_tensor_cpu: torch.Tensor, optional
+# Global cache for compiled kernels
+_compiled_kernel_cache = {}
+# Cache for per-shape metadata tensors
+_metadata_cache = {}
+
+
+def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     """
-
-    # Create new CPU tensor
-    torch_tensor_cpu = cutlass_torch.matrix(
-        l,
-        mode0,
-        mode1,
-        is_mode0_major,
-        cutlass.Float32,
-    )
-
-    # Create GPU tensor from CPU tensor (new or existing)
-    cute_tensor, torch_tensor = cutlass_torch.cute_tensor_like(
-        torch_tensor_cpu, dtype, is_dynamic_layout, assumed_align=16
-    )
-
-    # Mark tensor with element divisibility for 16B alignment
-    cute_tensor.mark_compact_shape_dynamic(
-        mode=0 if is_mode0_major else 1,
-        stride_order=(2, 1, 0) if is_mode0_major else (2, 0, 1),
-        divisibility=32 if dtype == cutlass.Float4E2M1FN else 16,
-    )
-
-    # omit stride for L mode as it is always 1
-    stride = (1, mode0) if is_mode0_major else (mode1, 1)
-
-    return (
-        torch_tensor.data_ptr(),
-        torch_tensor,
-        cute_tensor,
-        torch_tensor_cpu,
-        stride,
-    )
-
-
-def create_tensors_abc_for_all_groups(
-    problem_sizes_mnkl: List[tuple[int, int, int, int]],
-    ab_dtype: Type[cutlass.Numeric],
-    c_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-) -> tuple[
-    List[List[int]],
-    List[List[torch.Tensor]],
-    List[tuple],
-    List[List[tuple]],
-    List[List[torch.Tensor]],
-]:
-    ref_torch_fp32_tensors_abc = []
-    torch_tensors_abc = []
-    cute_tensors_abc = []
-    strides_abc = []
-    ptrs_abc = []
-
-    # Iterate through all groups and create tensors for each group
-    for group_idx, (m, n, k, l) in enumerate(problem_sizes_mnkl):
-        # Create tensors  A, B, C
-        (
-            ptr_a,
-            torch_tensor_a,
-            cute_tensor_a,
-            ref_torch_fp32_tensor_a,
-            stride_mk_a,
-        ) = create_tensor_and_stride(l, m, k, a_major == "m", ab_dtype)
-
-        (
-            ptr_b,
-            torch_tensor_b,
-            cute_tensor_b,
-            ref_torch_fp32_tensor_b,
-            stride_nk_b,
-        ) = create_tensor_and_stride(l, n, k, b_major == "n", ab_dtype)
-
-        (
-            ptr_c,
-            torch_tensor_c,
-            cute_tensor_c,
-            ref_torch_fp32_tensor_c,
-            stride_mn_c,
-        ) = create_tensor_and_stride(l, m, n, c_major == "m", c_dtype)
-
-        ref_torch_fp32_tensors_abc.append(
-            [ref_torch_fp32_tensor_a, ref_torch_fp32_tensor_b, ref_torch_fp32_tensor_c]
-        )
-
-        ptrs_abc.append([ptr_a, ptr_b, ptr_c])
-        torch_tensors_abc.append([torch_tensor_a, torch_tensor_b, torch_tensor_c])
-        strides_abc.append([stride_mk_a, stride_nk_b, stride_mn_c])
-        cute_tensors_abc.append(
-            (
-                cute_tensor_a,
-                cute_tensor_b,
-                cute_tensor_c,
-            )
-        )
-
-    return (
-        ptrs_abc,
-        torch_tensors_abc,
-        cute_tensors_abc,
-        strides_abc,
-        ref_torch_fp32_tensors_abc,
-    )
-
-
-@cute.jit
-def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-    sf_ref_tensor: cute.Tensor,
-    sf_mma_tensor: cute.Tensor,
-):
-    """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
-    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
-    # group to ((32, 4, rest_m), (4, rest_k), l)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
-    for i in cutlass.range(cute.size(sf_ref_tensor)):
-        mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
-        sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
-
-
-# Create scale factor tensor SFA/SFB
-def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
-    def ceil_div(a, b):
-        return (a + b - 1) // b
-
-    sf_k = ceil_div(k, sf_vec_size)
-    ref_shape = (l, mn, sf_k)
-
-    atom_m = (32, 4)
-    atom_k = 4
-    mma_shape = (
-        l,
-        ceil_div(mn, atom_m[0] * atom_m[1]),
-        ceil_div(sf_k, atom_k),
-        atom_m[0],
-        atom_m[1],
-        atom_k,
-    )
-
-    ref_permute_order = (1, 2, 0)
-    mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-    # Create f32 ref torch tensor (cpu)
-    ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-        ref_shape,
-        torch.float32,
-        permute_order=ref_permute_order,
-        init_type=cutlass_torch.TensorInitType.RANDOM,
-        init_config=cutlass_torch.RandomInitConfig(
-            min_val=1,
-            max_val=3,
-        ),
-    )
-
-    # Create f32 cute torch tensor (cpu)
-    cute_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-        mma_shape,
-        torch.float32,
-        permute_order=mma_permute_order,
-        init_type=cutlass_torch.TensorInitType.RANDOM,
-        init_config=cutlass_torch.RandomInitConfig(
-            min_val=0,
-            max_val=1,
-        ),
-    )
-
-    # convert ref f32 tensor to cute f32 tensor
-    cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-        from_dlpack(ref_f32_torch_tensor_cpu),
-        from_dlpack(cute_f32_torch_tensor_cpu),
-    )
-    cute_f32_torch_tensor = cute_f32_torch_tensor_cpu.cuda()
-
-    # reshape makes memory contiguous
-    ref_f32_torch_tensor_cpu = (
-        ref_f32_torch_tensor_cpu.permute(2, 0, 1)
-        .unsqueeze(-1)
-        .expand(l, mn, sf_k, sf_vec_size)
-        .reshape(l, mn, sf_k * sf_vec_size)
-        .permute(*ref_permute_order)
-    )
-    # prune to mkl for reference check.
-    ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
-
-    # Create dtype cute torch tensor (cpu)
-    cute_tensor, cute_torch_tensor = cutlass_torch.cute_tensor_like(
-        cute_f32_torch_tensor_cpu,
-        dtype,
-        is_dynamic_layout=True,
-        assumed_align=16,
-    )
-
-    # Convert f32 cute tensor to dtype cute tensor
-    cute_tensor = cutlass_torch.convert_cute_tensor(
-        cute_f32_torch_tensor,
-        cute_tensor,
-        dtype,
-        is_dynamic_layout=True,
-    )
-    # get pointer of the tensor
-    ptr = cute_torch_tensor.data_ptr()
-    return ref_f32_torch_tensor_cpu, ptr, cute_tensor, cute_torch_tensor
-
-
-def create_tensors_sfasfb_for_all_groups(
-    problem_sizes_mnkl: List[tuple[int, int, int, int]],
-    sf_dtype: Type[cutlass.Numeric],
-    sf_vec_size: int,
-) -> tuple[
-    List[List[int]],
-    List[List[torch.Tensor]],
-    List[tuple],
-    List[List[torch.Tensor]],
-]:
-    ptrs_sfasfb = []
-    torch_tensors_sfasfb = []
-    cute_tensors_sfasfb = []
-    refs_sfasfb = []
-
-    # Iterate through all groups and create tensors for each group
-    for group_idx, (m, n, k, l) in enumerate(problem_sizes_mnkl):
-        sfa_ref, ptr_sfa, sfa_tensor, sfa_torch = create_scale_factor_tensor(
-            l, m, k, sf_vec_size, sf_dtype
-        )
-        sfb_ref, ptr_sfb, sfb_tensor, sfb_torch = create_scale_factor_tensor(
-            l, n, k, sf_vec_size, sf_dtype
-        )
-        ptrs_sfasfb.append([ptr_sfa, ptr_sfb])
-        torch_tensors_sfasfb.append([sfa_torch, sfb_torch])
-        cute_tensors_sfasfb.append(
-            (
-                sfa_tensor,
-                sfb_tensor,
-            )
-        )
-        refs_sfasfb.append([sfa_ref, sfb_ref])
-
-    return (
-        ptrs_sfasfb,
-        torch_tensors_sfasfb,
-        cute_tensors_sfasfb,
-        refs_sfasfb,
-    )
-
-
-def run(
-    num_groups: int,
-    problem_sizes_mnkl: List[Tuple[int, int, int, int]],
-    ab_dtype: Type[cutlass.Numeric],
-    sf_dtype: Type[cutlass.Numeric],
-    sf_vec_size: int,
-    c_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-    mma_tiler_mn: Tuple[int, int],
-    cluster_shape_mn: Tuple[int, int],
-    tolerance: float = 1e-01,
-    warmup_iterations: int = 0,
-    iterations: int = 1,
-    skip_ref_check: bool = False,
-    use_cold_l2: bool = False,
-    **kwargs,
-):
-    """Run SM100 grouped blockscaledGEMM example with specified configurations.
-
-    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
-    :type use_cold_l2: bool, optional
-    :return: Execution time of the GEMM kernel in microseconds
-    :rtype: float
+    Compile the kernel once and cache it using problem_sizes as the key.
     """
-    print("Running Blackwell Grouped GEMM test with:")
-    print(f"{num_groups} groups")
-    for i, (m, n, k, l) in enumerate(problem_sizes_mnkl):
-        print(f"Group {i}: {m}x{n}x{k}x{l}")
-    print(f"AB dtype: {ab_dtype}, SF dtype: {sf_dtype}, SF Vec size: {sf_vec_size}")
-    print(f"C dtype: {c_dtype}")
-    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
-    print(f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}")
-    print(f"Tolerance: {tolerance}")
-    print(f"Warmup iterations: {warmup_iterations}")
-    print(f"Iterations: {iterations}")
-    print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
+    global _compiled_kernel_cache
 
-    # Skip unsupported testcase
-    if not Sm100GroupedBlockScaledGemmKernel.can_implement(
-        ab_dtype,
-        sf_dtype,
-        sf_vec_size,
-        c_dtype,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        problem_sizes_mnkl,
-        a_major,
-        b_major,
-        c_major,
-    ):
-        raise TypeError(
-            f"Unsupported testcase {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {problem_sizes_mnkl}, {a_major}, {b_major}, {c_major}"
-        )
+    num_groups = len(problem_sizes)
+    problem_sizes_tuple = tuple(tuple(ps) for ps in problem_sizes)
+    cache_key = (num_groups, problem_sizes_tuple)
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is required to run this example!")
-
-    torch.manual_seed(2025)
-
-    # Create tensors A, B, C for all groups
-    (
-        ptrs_abc,
-        torch_tensors_abc,
-        cute_tensors_abc,
-        strides_abc,
-        ref_f32_torch_tensors_abc,
-    ) = create_tensors_abc_for_all_groups(
-        problem_sizes_mnkl,
-        ab_dtype,
-        c_dtype,
-        a_major,
-        b_major,
-        c_major,
-    )
-    # Create tensors SFA, SFB for all groups
-    (
-        ptrs_sfasfb,
-        torch_tensors_sfasfb,
-        cute_tensors_sfasfb,
-        refs_f32_torch_tensors_sfasfb,
-    ) = create_tensors_sfasfb_for_all_groups(
-        problem_sizes_mnkl,
-        sf_dtype,
-        sf_vec_size,
-    )
-
-    # Choose A, B, C, SFA, SFB with the smallest size to create initial tensormaps
-    key_size_a = lambda item: item[1][0] * item[1][2]
-    key_size_b = lambda item: item[1][1] * item[1][2]
-    key_size_c = lambda item: item[1][0] * item[1][1]
-    # Find the indices of the groups with the smallest tensor sizes
-    min_a_idx, _ = min(enumerate(problem_sizes_mnkl), key=key_size_a)
-    min_b_idx, _ = min(enumerate(problem_sizes_mnkl), key=key_size_b)
-    min_c_idx, _ = min(enumerate(problem_sizes_mnkl), key=key_size_c)
-    initial_cute_tensors_abc = [
-        cute_tensors_abc[min_a_idx][0],  # A with smallest (m, k)
-        cute_tensors_abc[min_b_idx][1],  # B with smallest (n, k)
-        cute_tensors_abc[min_c_idx][2],  # C with smallest (m, n)
-    ]
-    initial_cute_tensors_sfasfb = [
-        cute_tensors_sfasfb[min_a_idx][0],  # SFA with smallest (m, k)'s group
-        cute_tensors_sfasfb[min_b_idx][1],  # SFB with smallest (n, k)'s group
-    ]
-
-    hardware_info = cutlass.utils.HardwareInfo()
-    sm_count = hardware_info.get_max_active_clusters(1)
-    max_active_clusters = hardware_info.get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
-    # Prepare tensormap buffer for each SM
-    num_tensormap_buffers = sm_count
-    tensormap_shape = (
-        num_tensormap_buffers,
-        Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
-        Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8,
-    )
-    tensor_of_tensormap, tensor_of_tensormap_torch = cutlass_torch.cute_tensor_like(
-        torch.empty(tensormap_shape, dtype=torch.int64),
-        cutlass.Int64,
-        is_dynamic_layout=False,
-    )
+    if cache_key in _compiled_kernel_cache:
+        return _compiled_kernel_cache[cache_key]
 
     grouped_blockscaled_gemm = Sm100GroupedBlockScaledGemmKernel(
-        sf_vec_size,
-        mma_tiler_mn,
-        cluster_shape_mn,
+        SF_VEC_SIZE,
+        MMA_TILER_MN,
+        CLUSTER_SHAPE_MN,
     )
 
-    # layout (num_groups, 4):(4, 1)
-    (
-        tensor_of_dim_size_mnkl,
-        tensor_of_dim_size_mnkl_torch,
-    ) = cutlass_torch.cute_tensor_like(
-        torch.tensor(problem_sizes_mnkl, dtype=torch.int32),
-        cutlass.Int32,
-        is_dynamic_layout=False,
-        assumed_align=16,
+    hardware_info = cutlass.utils.HardwareInfo()
+    max_active_clusters = hardware_info.get_max_active_clusters(
+        CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]
     )
 
-    # layout (num_groups, 3, 2):(6, 2, 1)
-    tensor_of_strides_abc, tensor_of_strides_abc_torch = cutlass_torch.cute_tensor_like(
-        torch.tensor(strides_abc, dtype=torch.int32),
-        cutlass.Int32,
-        is_dynamic_layout=False,
-        assumed_align=16,
+    dummy_problem_sizes = make_ptr(
+        cutlass.Int32, 0, cute.AddressSpace.gmem, assumed_align=16,
+    )
+    dummy_strides_abc = make_ptr(
+        cutlass.Int32, 0, cute.AddressSpace.gmem, assumed_align=16,
+    )
+    dummy_ptrs_abc = make_ptr(
+        cutlass.Int64, 0, cute.AddressSpace.gmem, assumed_align=16,
+    )
+    dummy_ptrs_sfasfb = make_ptr(
+        cutlass.Int64, 0, cute.AddressSpace.gmem, assumed_align=16,
+    )
+    dummy_tensormap = make_ptr(
+        cutlass.Int64, 0, cute.AddressSpace.gmem, assumed_align=16,
+    )
+    total_num_clusters = cutlass.Int32(1)
+
+    compiled_func = cute.compile(
+        grouped_blockscaled_gemm,
+        num_groups,
+        dummy_problem_sizes,
+        dummy_strides_abc,
+        dummy_ptrs_abc,
+        dummy_ptrs_sfasfb,
+        dummy_tensormap,
+        total_num_clusters,
+        max_active_clusters,
+        options="--opt-level 2 --enable-tvm-ffi",
     )
 
-    # layout (num_groups,3):(3, 1)
-    tensor_of_ptrs_abc, tensor_of_ptrs_abc_torch = cutlass_torch.cute_tensor_like(
-        torch.tensor(ptrs_abc, dtype=torch.int64),
-        cutlass.Int64,
-        is_dynamic_layout=False,
-        assumed_align=16,
-    )
+    _compiled_kernel_cache[cache_key] = compiled_func
+    return compiled_func
 
-    # layout (num_groups,2):(2, 1)
-    tensor_of_ptrs_sfasfb, tensor_of_ptrs_sfasfb_torch = cutlass_torch.cute_tensor_like(
-        torch.tensor(ptrs_sfasfb, dtype=torch.int64),
-        cutlass.Int64,
-        is_dynamic_layout=False,
-        assumed_align=16,
-    )
 
-    # Compute total number of cluster tiles we need to compute for given grouped GEMM problem
-    def compute_total_num_clusters(
-        problem_sizes_mnkl: List[tuple[int, int, int, int]],
-        cluster_tile_shape_mn: tuple[int, int],
-    ) -> int:
+def custom_kernel(data: input_t) -> output_t:
+    """
+    Execute the block-scaled group GEMM kernel.
+    """
+    abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
+    num_groups = len(problem_sizes)
+
+    compiled_func = compile_kernel(problem_sizes)
+
+    abc_ptrs = []
+    sfasfb_ptrs = []
+    strides_abc = []
+    for (a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l) in zip(
+        abc_tensors, sfasfb_reordered_tensors, problem_sizes
+    ):
+        abc_ptrs.append([a.data_ptr(), b.data_ptr(), c.data_ptr()])
+        sfasfb_ptrs.append([sfa_reordered.data_ptr(), sfb_reordered.data_ptr()])
+        # Use logical strides in (m,n,k,l) space (matches kernel expectations)
+        strides_abc.append([(k, 1), (k, 1), (n, 1)])
+
+    problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
+    cached_meta = _metadata_cache.get(problem_sizes_key)
+    if cached_meta is None:
+        tensor_of_problem_sizes = torch.tensor(
+            problem_sizes, dtype=torch.int32, device="cuda"
+        )
+        tensor_of_strides_abc = torch.tensor(
+            strides_abc, dtype=torch.int32, device="cuda"
+        )
+
+        cta_tile_shape_mn = [128, MMA_TILER_MN[1]]
+        cluster_tile_shape_mn = tuple(
+            x * y for x, y in zip(cta_tile_shape_mn, CLUSTER_SHAPE_MN)
+        )
         total_num_clusters = 0
-        for m, n, _, _ in problem_sizes_mnkl:
+        for m, n, _, _ in problem_sizes:
             num_clusters_mn = tuple(
                 (x + y - 1) // y for x, y in zip((m, n), cluster_tile_shape_mn)
             )
             total_num_clusters += functools.reduce(lambda x, y: x * y, num_clusters_mn)
-        return total_num_clusters
 
-    # Compute cluster tile shape
-    def compute_cluster_tile_shape(
-        mma_tiler_mn: tuple[int, int],
-        cluster_shape_mn: tuple[int, int],
-    ) -> tuple[int, int]:
-        cta_tile_shape_mn = [128, mma_tiler_mn[1]]
-        return tuple(x * y for x, y in zip(cta_tile_shape_mn, cluster_shape_mn))
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = 148
+        max_active_clusters = hardware_info.get_max_active_clusters(
+            CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]
+        )
+        tensormap_shape = (
+            sm_count,
+            Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
+            Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8,
+        )
+        tensor_of_tensormap = torch.empty(
+            tensormap_shape, dtype=torch.int64, device="cuda"
+        )
 
-    cluster_tile_shape_mn = compute_cluster_tile_shape(mma_tiler_mn, cluster_shape_mn)
-    total_num_clusters = compute_total_num_clusters(
-        problem_sizes_mnkl, cluster_tile_shape_mn
-    )
-
-    # Initialize Stream
-    current_stream = cutlass_torch.default_stream()
-
-    # Compile grouped GEMM kernel
-    compiled_grouped_gemm = cute.compile(
-        grouped_blockscaled_gemm,
-        initial_cute_tensors_abc[0],
-        initial_cute_tensors_abc[1],
-        initial_cute_tensors_abc[2],
-        initial_cute_tensors_sfasfb[0],
-        initial_cute_tensors_sfasfb[1],
-        num_groups,
-        tensor_of_dim_size_mnkl,
-        tensor_of_strides_abc,
-        tensor_of_ptrs_abc,
-        tensor_of_ptrs_sfasfb,
-        total_num_clusters,
-        tensor_of_tensormap,
-        max_active_clusters,
-        current_stream,
-        options=f"--opt-level 2",
-    )
-
-    # reference check
-    if not skip_ref_check:
-        compiled_grouped_gemm(
-            initial_cute_tensors_abc[0],
-            initial_cute_tensors_abc[1],
-            initial_cute_tensors_abc[2],
-            initial_cute_tensors_sfasfb[0],
-            initial_cute_tensors_sfasfb[1],
-            tensor_of_dim_size_mnkl,
+        cached_meta = (
+            tensor_of_problem_sizes,
             tensor_of_strides_abc,
-            tensor_of_ptrs_abc,
-            tensor_of_ptrs_sfasfb,
             tensor_of_tensormap,
-            current_stream,
+            total_num_clusters,
+            max_active_clusters,
         )
-        print("Verifying results...")
-
-        for i, (
-            (a_ref, b_ref, c_ref),
-            (sfa_ref, sfb_ref),
-            (a_tensor, b_tensor, c_tensor),
-            (m, n, k, l),
-        ) in enumerate(
-            zip(
-                ref_f32_torch_tensors_abc,
-                refs_f32_torch_tensors_sfasfb,
-                cute_tensors_abc,
-                problem_sizes_mnkl,
-            )
-        ):
-            ref_res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
-            ref_res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
-            ref = torch.einsum("mkl,nkl->mnl", ref_res_a, ref_res_b)
-
-            print(f"checking group {i}")
-            c_ref_device = c_ref.cuda()
-
-            cute.testing.convert(
-                c_tensor,
-                from_dlpack(c_ref_device, assumed_align=16).mark_layout_dynamic(
-                    leading_dim=(1 if c_major == "n" else 0)
-                ),
-            )
-
-            c_ref = c_ref_device.cpu()
-
-            if c_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
-                torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
-            elif c_dtype in (cutlass.Float8E5M2, cutlass.Float8E4M3FN):
-                # Convert ref : f32 -> f8 -> f32
-                ref_f8_ = torch.empty(
-                    *(l, m, n), dtype=torch.uint8, device="cuda"
-                ).permute(1, 2, 0)
-                ref_f8 = from_dlpack(ref_f8_, assumed_align=16).mark_layout_dynamic(
-                    leading_dim=1
-                )
-                ref_f8.element_type = c_dtype
-                ref_device = ref.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
-                ref_tensor = from_dlpack(
-                    ref_device, assumed_align=16
-                ).mark_layout_dynamic(leading_dim=1)
-                cute.testing.convert(ref_tensor, ref_f8)
-                cute.testing.convert(ref_f8, ref_tensor)
-                ref = ref_device.cpu()
-                torch.testing.assert_close(c_ref, ref, atol=tolerance, rtol=1e-02)
-    def generate_tensors():
+        _metadata_cache[problem_sizes_key] = cached_meta
+    else:
         (
-            ptrs_abc_workspace,
-            torch_tensors_abc_workspace,
-            cute_tensors_abc_workspace,
-            strides_abc_workspace,
-            _,
-        ) = create_tensors_abc_for_all_groups(
-            problem_sizes_mnkl,
-            ab_dtype,
-            c_dtype,
-            a_major,
-            b_major,
-            c_major,
-        )
+            tensor_of_problem_sizes,
+            tensor_of_strides_abc,
+            tensor_of_tensormap,
+            total_num_clusters,
+            max_active_clusters,
+        ) = cached_meta
 
-        (
-            ptrs_sfasfb_workspace,
-            torch_tensors_sfasfb_workspace,
-            cute_tensors_sfasfb_workspace,
-            _,
-        ) = create_tensors_sfasfb_for_all_groups(
-            problem_sizes_mnkl,
-            sf_dtype,
-            sf_vec_size,
-        )
+    tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
+    tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
 
-        initial_cute_tensors_abc_workspace = [
-            cute_tensors_abc_workspace[min_a_idx][0],  # A with smallest (m, k)
-            cute_tensors_abc_workspace[min_b_idx][1],  # B with smallest (n, k)
-            cute_tensors_abc_workspace[min_c_idx][2],  # C with smallest (m, n)
-        ]
-
-        initial_cute_tensors_sfasfb_workspace = [
-            cute_tensors_sfasfb_workspace[min_a_idx][
-                0
-            ],  # SFA with smallest (m, k)'s group
-            cute_tensors_sfasfb_workspace[min_b_idx][
-                1
-            ],  # SFB with smallest (n, k)'s group
-        ]
-
-        # Create new tensors for this workspace
-        tensor_of_strides_abc_workspace, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(strides_abc_workspace, dtype=torch.int32),
-            cutlass.Int32,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-
-        tensor_of_ptrs_abc_workspace, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_abc_workspace, dtype=torch.int64),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-
-        tensor_of_ptrs_sfasfb_workspace, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_sfasfb_workspace, dtype=torch.int64),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-
-        tensormap_workspace, _ = cutlass_torch.cute_tensor_like(
-            torch.empty(tensormap_shape, dtype=torch.int64),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-        )
-
-        return cute.testing.JitArguments(
-            initial_cute_tensors_abc_workspace[0],
-            initial_cute_tensors_abc_workspace[1],
-            initial_cute_tensors_abc_workspace[2],
-            initial_cute_tensors_sfasfb_workspace[0],
-            initial_cute_tensors_sfasfb_workspace[1],
-            tensor_of_dim_size_mnkl,
-            tensor_of_strides_abc_workspace,
-            tensor_of_ptrs_abc_workspace,
-            tensor_of_ptrs_sfasfb_workspace,
-            tensormap_workspace,
-            current_stream,
-        )
-
-    workspace_count = 1
-    if use_cold_l2:
-        one_workspace_bytes = (
-            sum(
-                [
-                    sum(
-                        [
-                            torch_tensor.numel() * torch_tensor.element_size()
-                            for torch_tensor in group_tensors
-                        ]
-                    )
-                    for group_tensors in torch_tensors_abc + torch_tensors_sfasfb
-                ]
-            )
-            +
-            # Add size of strides tensor
-            tensor_of_strides_abc_torch.numel()
-            * tensor_of_strides_abc_torch.element_size()
-            +
-            # Add size of ptrs tensor A, B, C
-            tensor_of_ptrs_abc_torch.numel() * tensor_of_ptrs_abc_torch.element_size()
-            +
-            # Add size of ptrs tensor SFA, SFB
-            tensor_of_ptrs_sfasfb_torch.numel()
-            * tensor_of_ptrs_sfasfb_torch.element_size()
-            +
-            # Add size of tensormap tensor
-            tensor_of_tensormap_torch.numel() * tensor_of_tensormap_torch.element_size()
-        )
-        workspace_count = cute.testing.get_workspace_count(
-            one_workspace_bytes, warmup_iterations, iterations
-        )
-
-    exec_time = cute.testing.benchmark(
-        compiled_grouped_gemm,
-        workspace_generator=generate_tensors,
-        workspace_count=workspace_count,
-        stream=current_stream,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
+    ptr_of_problem_sizes = make_ptr(
+        cutlass.Int32, tensor_of_problem_sizes.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+    ptr_of_strides_abc = make_ptr(
+        cutlass.Int32, tensor_of_strides_abc.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+    ptr_of_ptrs_abc = make_ptr(
+        cutlass.Int64, tensor_of_abc_ptrs.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+    ptr_of_ptrs_sfasfb = make_ptr(
+        cutlass.Int64, tensor_of_sfasfb_ptrs.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+    ptr_of_tensormap = make_ptr(
+        cutlass.Int64, tensor_of_tensormap.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
     )
 
-    return exec_time  # Return execution time in microseconds
-
-
-if __name__ == "__main__":
-
-    def parse_comma_separated_ints(s: str) -> tuple[int, ...]:
-        try:
-            return tuple(int(x.strip()) for x in s.split(","))
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                "Invalid format. Expected comma-separated integers."
-            )
-
-    def parse_comma_separated_tuples(s: str) -> List[tuple[int, ...]]:
-        if s.strip().startswith("("):
-            # Split on ),( to separate tuples
-            tuples = s.strip("()").split("),(")
-            result = []
-            tuple_len = None
-
-            for t in tuples:
-                # Parse individual tuple
-                nums = [int(x.strip()) for x in t.split(",")]
-
-                # Validate tuple length consistency
-                if tuple_len is None:
-                    tuple_len = len(nums)
-                elif len(nums) != tuple_len:
-                    raise argparse.ArgumentTypeError(
-                        "All tuples must have the same length"
-                    )
-
-                result.append(tuple(nums))
-            return result
-
-        raise argparse.ArgumentTypeError(
-            "Invalid format. Expected comma-separated integers or list of tuples"
-        )
-
-    parser = argparse.ArgumentParser(
-        description="Example of Grouped GEMM on Blackwell."
-    )
-    parser.add_argument(
-        "--num_groups",
-        type=int,
-        default=2,
-        help="Number of groups",
-    )
-    parser.add_argument(
-        "--problem_sizes_mnkl",
-        type=parse_comma_separated_tuples,
-        default=((128, 128, 128, 1), (128, 128, 128, 1)),
-        help="a tuple of problem sizes for each group (comma-separated tuples)",
-    )
-    parser.add_argument(
-        "--mma_tiler_mn",
-        type=parse_comma_separated_ints,
-        default=(128, 128),
-        help="Mma tile shape (comma-separated)",
-    )
-    parser.add_argument(
-        "--cluster_shape_mn",
-        type=parse_comma_separated_ints,
-        default=(1, 1),
-        help="Cluster shape (comma-separated)",
-    )
-    parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
-    parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E8M0FNU)
-    parser.add_argument("--sf_vec_size", type=int, default=16)
-    parser.add_argument("--c_dtype", type=cutlass.dtype, default=cutlass.Float16)
-    parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
-    parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
-    parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
-    parser.add_argument(
-        "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
-    )
-    parser.add_argument(
-        "--warmup_iterations", type=int, default=0, help="Warmup iterations"
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=1,
-        help="Number of iterations to run the kernel",
-    )
-    parser.add_argument(
-        "--skip_ref_check", action="store_true", help="Skip reference checking"
-    )
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer tensor sets to ensure L2 cold cache",
+    compiled_func(
+        ptr_of_problem_sizes,
+        ptr_of_strides_abc,
+        ptr_of_ptrs_abc,
+        ptr_of_ptrs_sfasfb,
+        ptr_of_tensormap,
+        total_num_clusters,
     )
 
-    args = parser.parse_args()
-
-    if (
-        len(args.problem_sizes_mnkl) != 0
-        and len(args.problem_sizes_mnkl) != args.num_groups
-    ):
-        parser.error("--problem_sizes_mnkl must contain exactly num_groups tuples")
-
-    # l mode must be 1 for all groups
-    for _, _, _, l in args.problem_sizes_mnkl:
-        if l != 1:
-            parser.error("l must be 1 for all groups")
-
-    if len(args.mma_tiler_mn) != 2:
-        parser.error("--mma_tiler_mn must contain exactly 2 values")
-
-    if len(args.cluster_shape_mn) != 2:
-        parser.error("--cluster_shape_mn must contain exactly 2 values")
-
-    run(
-        args.num_groups,
-        args.problem_sizes_mnkl,
-        args.ab_dtype,
-        args.sf_dtype,
-        args.sf_vec_size,
-        args.c_dtype,
-        args.a_major,
-        args.b_major,
-        args.c_major,
-        args.mma_tiler_mn,
-        args.cluster_shape_mn,
-        args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-    )
-    print("PASS")
+    return [abc_tensors[i][2] for i in range(num_groups)]

@@ -93,4 +93,31 @@ benchmarks:
 | 3 | 87.9 µs | -48% | 1.91x |
 | 4 | 84.2 µs | -45% | 1.83x |
 
-TODO: Tinker with stages per benchmark case (AB/C/ACC) and re-measure.
+
+
+
+---
+
+## 2026-01-31: (submissionv2) moved to nvidias group gemm implementation
+
+### Changes
+- Added `apache-tvm-ffi` install helper (mirrors `backup.py`).
+- Enabled `--enable-tvm-ffi` in `cute.compile` options.
+
+### Result (B200 benchmark)
+`nvidia_group_ex.py`:
+- Case 1: 112 ± 0.4 µs
+- Case 2: 104 ± 0.3 µs
+- Case 3: 71.0 ± 1.25 µs
+- Case 4: 65.8 ± 0.24 µs
+
+`submissionv2.py` (with TVM-FFI enabled):
+- Case 1: 93.7 ± 0.09 µs
+- Case 2: 84.9 ± 0.16 µs
+- Case 3: 51.7 ± 0.18 µs
+- Case 4: 49.0 ± 0.16 µs
+
+### Notes
+TVM-FFI reduces host-side launch/argument overhead. The kernel math is unchanged;
+improvements come from a lower-overhead ABI and lighter launch path, which matters
+more for many small grouped GEMMs.
