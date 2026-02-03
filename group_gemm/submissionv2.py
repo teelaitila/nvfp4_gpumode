@@ -64,6 +64,31 @@ Constraints:
   i.e, number of elements is a multiple of 16 and 32 for Float8 and Float4, respectively.
 """
 
+# =============================================================================
+# Tunables / configuration knobs
+# =============================================================================
+SF_VEC_SIZE = 16  # Scale factor vector size for NVF4
+MMA_TILER_MN = (128, 256)  # MMA tile shape (M, N)
+CLUSTER_SHAPE_MN = (1, 2)  # Cluster shape (M, N) for N multicast
+DEFAULT_OCCUPANCY = 1  # Target CTAs per SM
+TMEM_ALLOC_COLS = 512  # TMEM columns allocated per CTA
+
+# SMEM bookkeeping (tensormap + barriers + tmem mgmt)
+RESERVED_SMEM_BYTES = 1024
+BYTES_PER_TENSORMAP = 128
+NUM_TENSORMAPS = 5
+TENSOR_MEMORY_MANAGEMENT_BYTES = 12
+
+# Fixed dtypes for this kernel
+AB_DTYPE = cutlass.Float4E2M1FN
+SF_DTYPE = cutlass.Float8E4M3FN  # float8_e4m3fnuz for NVF4
+C_DTYPE = cutlass.Float16
+
+# Problem size caps (not used for scheduling, just metadata)
+MAX_M = 512
+MAX_N = 7168
+MAX_K = 7168
+
 
 class Sm100GroupedBlockScaledGemmKernel:
     """This example demonstrates an implementation of grouped blockscaled GEMM using a TMA plus Blackwell SM100 TensorCore
@@ -99,6 +124,13 @@ class Sm100GroupedBlockScaledGemmKernel:
         - Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
     """
 
+    # Size of smem we reserved for mbarrier, tensor memory management and tensormap update
+    reserved_smem_bytes = RESERVED_SMEM_BYTES
+    bytes_per_tensormap = BYTES_PER_TENSORMAP
+    num_tensormaps = NUM_TENSORMAPS
+    # size of smem used for tensor memory management
+    tensor_memory_management_bytes = TENSOR_MEMORY_MANAGEMENT_BYTES
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -129,7 +161,7 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         self.tensormap_update_mode = utils.TensorMapUpdateMode.SMEM
 
-        self.occupancy = 1
+        self.occupancy = DEFAULT_OCCUPANCY
         # Set specialized warp ids
         self.epilog_warp_id = (
             0,
@@ -157,8 +189,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             num_threads=64,
         )
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        SM100_TMEM_CAPACITY_COLUMNS = 512
-        self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+        self.num_tmem_alloc_cols = TMEM_ALLOC_COLS
 
     # Set up configurations that dependent on gemm inputs.
     def _setup_attributes(self):
@@ -766,7 +797,9 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id)
+        num_acc_consumer_threads = len(self.epilog_warp_id) * (
+            2 if self.use_2cta_instrs else 1
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -807,7 +840,19 @@ class Sm100GroupedBlockScaledGemmKernel:
         b_full_mcast_mask = None
         sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
-        # No multicast for cluster_shape_mn=(1,1); keep masks as None
+        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or self.use_2cta_instrs):
+            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+            )
+            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+            )
+            sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+            )
+            sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1
+            )
 
         #
         # Local_tile partition global tensors
@@ -1426,7 +1471,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                 cute.arch.alloc_tmem(
                     self.num_tmem_alloc_cols,
                     tmem_holding_buf,
-                    is_two_cta=False,
+                    is_two_cta=self.use_2cta_instrs,
                 )
 
             #
@@ -1634,11 +1679,15 @@ class Sm100GroupedBlockScaledGemmKernel:
             # Dealloc the tensor memory buffer
             #
             if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
+                cute.arch.relinquish_tmem_alloc_permit(
+                    is_two_cta=self.use_2cta_instrs
+                )
             self.epilog_sync_barrier.arrive_and_wait()
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.dealloc_tmem(
-                    acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=False
+                    acc_tmem_ptr,
+                    self.num_tmem_alloc_cols,
+                    is_two_cta=self.use_2cta_instrs,
                 )
             #
             # Wait for C store complete
@@ -2382,26 +2431,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             can_implement = False
         return can_implement
 
-    # Size of smem we reserved for mbarrier, tensor memory management and tensormap update
-    reserved_smem_bytes = 1024
-    bytes_per_tensormap = 128
-    num_tensormaps = 5
-    # size of smem used for tensor memory management
-    tensor_memory_management_bytes = 12
 
-
-# =============================================================================
-# Fixed kernel configuration defaults (NVF4 block-scaled GEMM)
-# =============================================================================
-SF_VEC_SIZE = 16  # Scale factor vector size for NVF4
-MMA_TILER_MN = (128, 128)  # MMA tile shape (M, N)
-CLUSTER_SHAPE_MN = (1, 1)  # Cluster shape (M, N)
-AB_DTYPE = cutlass.Float4E2M1FN
-SF_DTYPE = cutlass.Float8E4M3FN  # float8_e4m3fnuz for NVF4
-C_DTYPE = cutlass.Float16
-MAX_M = 512
-MAX_N = 7168
-MAX_K = 7168
 
 # Global cache for compiled kernels
 _compiled_kernel_cache = {}
@@ -2450,7 +2480,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     )
     total_num_clusters = cutlass.Int32(1)
 
-    compiled_func = cute.compile(
+    compiled_func = cute.compile[cute.GenerateLineInfo(True)](
         grouped_blockscaled_gemm,
         num_groups,
         dummy_problem_sizes,

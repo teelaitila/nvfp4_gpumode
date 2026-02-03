@@ -26,7 +26,6 @@ description: |
     sfb is torch.Tensor[float8_e4m3fnuz] of shape [N, K // 16, L]
   * `problem_sizes` is list of tuples (M, N, K, L)
   
-  Each group's matrix sizes `M` is divisible by mma_tiler_mn[0], `N` is divisible by mma_tiler_mn[1], `K` is divisible by 256.
   The ranking criteria is the geometric mean of the benchmark results.
   For the grand price, your kernel will be evaluated against the speed of light analysis
   and the solution closest to the speed of light will be awarded the grand price.
