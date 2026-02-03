@@ -28,13 +28,11 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.runtime import make_ptr
 
 """
 This example provides an experimental implementation of the SM100 grouped blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
@@ -172,8 +170,9 @@ class Sm100GroupedBlockScaledGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
+        self.sched_warp_id = 6
         self.threads_per_cta = 32 * len(
-            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
+            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id, self.sched_warp_id)
         )
         # Set barrier for epilogue sync and tmem ptr sync
         self.epilog_sync_barrier = pipeline.NamedBarrier(
@@ -270,6 +269,8 @@ class Sm100GroupedBlockScaledGemmKernel:
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma_sfb.thr_id.shape,),
         )
+
+        self.num_clc_stage = 1
 
         # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
@@ -581,6 +582,8 @@ class Sm100GroupedBlockScaledGemmKernel:
         self.tile_sched_params, grid = self._compute_grid(
             total_num_clusters, self.cluster_shape_mn, max_active_clusters
         )
+        # Response size is 4B * 4 elements
+        self.num_clc_response_bytes = 16
 
         self.buffer_align_bytes = 1024
         self.size_tensormap_in_i64 = (
@@ -595,6 +598,8 @@ class Sm100GroupedBlockScaledGemmKernel:
             tensormap_buffer: cute.struct.MemRange[
                 cutlass.Int64, self.size_tensormap_in_i64
             ]
+            clc_response_ptr: cute.struct.MemRange[cutlass.Int32, 1]
+            clc_ptr: cute.struct.MemRange[cutlass.Int64, self.num_clc_stage * 2]
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
@@ -702,7 +707,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         group_count: cutlass.Constexpr,
         problem_sizes_mnkl: cute.Tensor,
         strides_abc: cute.Tensor,
@@ -799,8 +804,34 @@ class Sm100GroupedBlockScaledGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
+        # Initialize clc_pipeline (barrier) and states
+        clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        cluster_size = cute.size(self.cluster_shape_mn)
+        num_clc_consumer_threads = 32 * (
+            1 + cluster_size * (1 + len(self.epilog_warp_id) + 1)
+        )
+        clc_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, num_clc_consumer_threads
+        )
+        clc_pipeline = pipeline.PipelineClcFetchAsync.create(
+            barrier_storage=storage.clc_ptr.data_ptr(),
+            num_stages=self.num_clc_stage,
+            producer_group=clc_pipeline_producer_group,
+            consumer_group=clc_pipeline_consumer_group,
+            tx_count=self.num_clc_response_bytes,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+
+        # Initial clc response pointer
+        clc_response_ptr = storage.clc_response_ptr.data_ptr()
+
+        clc_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.num_clc_stage
+        )
 
         #
         # Setup smem tensor A/B/SFA/SFB/C
@@ -996,8 +1027,11 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), grid_dim
+            tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+                tile_sched_params,
+                 cute.arch.block_idx(),
+                grid_dim,
+                clc_response_ptr,
             )
             # grouped gemm tile scheduler helper will compute the group index for the tile we're working on
             group_gemm_ts_helper = utils.GroupedGemmTileSchedulerHelper(
@@ -1208,14 +1242,43 @@ class Sm100GroupedBlockScaledGemmKernel:
                 #
                 # Advance to next tile
                 #
-                tile_sched.advance_to_next_work()
+                clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
                 last_group_idx = cur_group_idx
 
             #
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
+
+
+        #                
+        # Sched warp
+        #
+        if warp_idx == self.sched_warp_id and is_leader_cta:
+            #
+            # Persistent tile scheduling loop
+            #
+            clc_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.ProducerConsumer, self.num_clc_stage
+            )
+
+            while work_tile.is_valid_tile:
+                #
+                # Advance to next tile
+                #
+                clc_pipeline.producer_acquire(clc_producer_state)
+                mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
+                tile_sched.advance_to_next_work(mbarrier_addr)
+                clc_producer_state.advance()
+
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work_tile = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
+            clc_pipeline.producer_tail(clc_producer_state)
 
         #
         # Specialized MMA warp
@@ -1434,8 +1497,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                 #
                 # Advance to next tile
                 #
-                tile_sched.advance_to_next_work()
+                clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
 
             #
             # Wait for accumulator buffer empty
@@ -1659,8 +1724,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                 #
                 # Advance to next tile
                 #
-                tile_sched.advance_to_next_work()
+                clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
                 last_group_idx = cur_group_idx
 
             #
@@ -2121,8 +2188,7 @@ class Sm100GroupedBlockScaledGemmKernel:
     def _compute_grid(
         total_num_clusters: int,
         cluster_shape_mn: tuple[int, int],
-        max_active_clusters: cutlass.Constexpr[int],
-    ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
+    ) -> tuple[utils.ClcDynamicPersistentTileSchedulerParams, tuple[int, int, int]]:
         """Compute tile scheduler parameters and grid shape for grouped GEMM operations.
 
         :param total_num_clusters: Total number of clusters to process across all groups.
@@ -2145,13 +2211,11 @@ class Sm100GroupedBlockScaledGemmKernel:
             cutlass.Int32(total_num_clusters),
         )
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(
+        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             problem_shape_ntile_mnl, (*cluster_shape_mn, 1)
         )
 
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
-        )
+        grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
 
         return tile_sched_params, grid
 
