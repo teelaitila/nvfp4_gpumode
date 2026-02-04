@@ -1,7 +1,6 @@
 import subprocess
 import sys
 
-
 def install_package():
     """Install apache-tvm-ffi using pip"""
     try:
@@ -28,13 +27,11 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.runtime import make_ptr
 
 """
 This example provides an experimental implementation of the SM100 grouped blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
@@ -69,7 +66,7 @@ Constraints:
 # =============================================================================
 SF_VEC_SIZE = 16  # Scale factor vector size for NVF4
 MMA_TILER_MN = (128, 128)  # MMA tile shape (M, N)
-CLUSTER_SHAPE_MN = (1, 2)  # Cluster shape (M, N) for N multicast
+CLUSTER_SHAPE_MN = (1, 1)  # Cluster shape (M, N) for N multicast
 DEFAULT_OCCUPANCY = 1  # Target CTAs per SM
 TMEM_ALLOC_COLS = 512  # TMEM columns allocated per CTA
 SM_COUNT = 148  # B200 SM count for tensormap storage
@@ -2485,7 +2482,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     )
     total_num_clusters = cutlass.Int32(total_num_clusters)
 
-    compiled_func = cute.compile[cute.GenerateLineInfo(True)](
+    compiled_func = cute.compile(
         grouped_blockscaled_gemm,
         num_groups,
         problem_sizes_fake,

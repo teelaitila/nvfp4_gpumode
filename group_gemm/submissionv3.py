@@ -3,11 +3,20 @@ import sys
 
 
 def install_package():
-    """Install apache-tvm-ffi using pip"""
+    """Install dependencies using pip"""
     try:
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "apache-tvm-ffi"]
         )
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "nvidia-cutlass-dsl==4.4.0.dev0"]
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Error installing cutlass dev wheel: {e}")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "nvidia-cutlass-dsl"]
+            )
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error installing package: {e}")
@@ -18,9 +27,8 @@ install_package()
 
 from task import input_t, output_t
 
-
 import functools
-from typing import List, Type, Tuple, Union
+from typing import List, Type, Tuple, Union, Optional
 from inspect import isclass
 
 import torch
@@ -30,10 +38,14 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.pipeline import (
+    pipeline_init_arrive,
+    pipeline_init_wait,
+)
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
+from cutlass.cute.typing import Int32
 """
 This example provides an experimental implementation of the SM100 grouped blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
 
@@ -67,7 +79,7 @@ Constraints:
 # =============================================================================
 SF_VEC_SIZE = 16  # Scale factor vector size for NVF4
 MMA_TILER_MN = (128, 128)  # MMA tile shape (M, N)
-CLUSTER_SHAPE_MN = (1, 2)  # Cluster shape (M, N) for N multicast
+CLUSTER_SHAPE_MN = (1, 1)  # Cluster shape (M, N) for N multicast
 DEFAULT_OCCUPANCY = 1  # Target CTAs per SM
 TMEM_ALLOC_COLS = 512  # TMEM columns allocated per CTA
 SM_COUNT = 148  # B200 SM count for tensormap storage
@@ -580,7 +592,7 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
-            total_num_clusters, self.cluster_shape_mn, max_active_clusters
+            total_num_clusters, self.cluster_shape_mn
         )
         # Response size is 4B * 4 elements
         self.num_clc_response_bytes = 16
@@ -743,6 +755,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
+        is_first_cta_in_cluster = cta_rank_in_cluster == 0
         # coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -786,6 +799,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             consumer_group=ab_pipeline_consumer_group,
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
         # Initialize acc_pipeline (barrier) and states
@@ -802,6 +816,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
         # Initialize clc_pipeline (barrier) and states
@@ -1000,6 +1015,15 @@ class Sm100GroupedBlockScaledGemmKernel:
             bidz * grid_dim[1] * grid_dim[0] + bidy * grid_dim[0] + bidx
         )
 
+        tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+            tile_sched_params,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+            clc_response_ptr,
+        )
+
+        work_tile = tile_sched.initial_work_tile_info()
+
         tensormap_manager = utils.TensorMapManager(
             utils.TensorMapUpdateMode.SMEM,
             Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap,
@@ -1027,12 +1051,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
-                tile_sched_params,
-                 cute.arch.block_idx(),
-                grid_dim,
-                clc_response_ptr,
-            )
             # grouped gemm tile scheduler helper will compute the group index for the tile we're working on
             group_gemm_ts_helper = utils.GroupedGemmTileSchedulerHelper(
                 group_count,
@@ -1043,8 +1061,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             tensormap_init_done = cutlass.Boolean(False)
             # group index of last tile
             last_group_idx = cutlass.Int32(-1)
-
-            work_tile = tile_sched.initial_work_tile_info()
 
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
@@ -1257,7 +1273,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         #                
         # Sched warp
         #
-        if warp_idx == self.sched_warp_id and is_leader_cta:
+        if warp_idx == self.sched_warp_id and is_first_cta_in_cluster:
             #
             # Persistent tile scheduling loop
             #
@@ -1361,9 +1377,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), grid_dim
-            )
             # grouped gemm tile scheduler helper will compute the group index for the tile we're working on
             group_gemm_ts_helper = utils.GroupedGemmTileSchedulerHelper(
                 group_count,
@@ -1372,7 +1385,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 utils.create_initial_search_state(),
             )
 
-            work_tile = tile_sched.initial_work_tile_info()
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
@@ -1567,9 +1579,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), grid_dim
-            )
             # grouped gemm tile scheduler helper will compute the group index for the tile we're working on
             group_gemm_ts_helper = utils.GroupedGemmTileSchedulerHelper(
                 group_count,
@@ -1577,8 +1586,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 self.cluster_tile_shape_mnk,
                 utils.create_initial_search_state(),
             )
-
-            work_tile = tile_sched.initial_work_tile_info()
 
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage

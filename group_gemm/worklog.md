@@ -121,3 +121,36 @@ benchmarks:
 TVM-FFI reduces host-side launch/argument overhead. The kernel math is unchanged;
 improvements come from a lower-overhead ABI and lighter launch path, which matters
 more for many small grouped GEMMs.
+
+---
+
+## 2026-02-04: (dynamic.py) CLC Dynamic Persistent Scheduler
+
+### Changes
+- Replaced static persistent tile scheduler with CLC (Cluster Launch Control) dynamic persistent scheduler
+- Added `PipelineClcFetchAsync` for tile scheduling coordination
+- Added scheduler warp (`sched_warp_id = 6`) to handle CLC tile fetching
+
+### What CLC Dynamic Scheduler Does in group gemm
+- Uses hardware CLC instructions (`clusterlaunchcontrol.try_cancel`) to dynamically fetch next tile
+- Provides better load balancing than static scheduler when tile counts vary across groups
+- Adapts to available SMs rather than statically selected number
+
+### Result (B200 benchmark)
+`dynamic.py` (CLC dynamic persistent):
+- Case 1: 70.8 ± 0.11 µs (⚡ 69.0 µs)
+- Case 2: 65.5 ± 0.41 µs (⚡ 62.0 µs)
+- Case 3: 44.1 ± 0.19 µs (⚡ 41.3 µs)
+- Case 4: 41.5 ± 0.19 µs (⚡ 38.1 µs)
+
+### Comparison vs Previous Best (submissionv2.py)
+| Case | submissionv2 (static) | dynamic (CLC) | Improvement |
+|------|----------------------|---------------|-------------|
+| 1 | 93.7 µs | 70.8 µs | **24% faster** |
+| 2 | 84.9 µs | 65.5 µs | **23% faster** |
+| 3 | 51.7 µs | 44.1 µs | **15% faster** |
+| 4 | 49.0 µs | 41.5 µs | **15% faster** |
+
+### Notes
+CLC dynamic scheduling improves performance especially for grouped GEMMs with varying tile counts.
+The dynamic load balancing avoids idle SMs waiting for slower groups to finish.
