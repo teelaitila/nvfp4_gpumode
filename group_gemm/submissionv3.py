@@ -8,20 +8,13 @@ def install_package():
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "apache-tvm-ffi"]
         )
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "nvidia-cutlass-dsl==4.4.0.dev0"]
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Error installing cutlass dev wheel: {e}")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "nvidia-cutlass-dsl"]
-            )
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "nvidia-cutlass-dsl==4.4.0.dev0"]
+        )
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error installing package: {e}")
         return False
-
 
 install_package()
 
@@ -45,34 +38,6 @@ from cutlass.pipeline import (
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
-from cutlass.cute.typing import Int32
-"""
-This example provides an experimental implementation of the SM100 grouped blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
-
-A grouped blockscaled GEMM example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
-
-This example demonstrates an implementation of grouped blockscaled GEMM using a TMA plus Blackwell SM100 TensorCore
-warp-specialized persistent kernel.
-The grouped GEMM workload computes a batch of GEMM operations with distinct problem sizes. Pointers to matrices
-in global memory are passed to the kernel in an array (also held in global memory). Similarly, problem shapes and
-strides are also stored in arrays in GMEM.
-
-This differs from "Batched Array" GEMM since the size of each GEMM problem in the grouped GEMM concept may be distinct.
-
-Constraints:
-* Supported input data types: mxf8, mxf4, nvf4
-  see detailed valid dtype combinations in below Sm100GroupedBlockScaledGemmKernel class documentation
-* A/B tensors must have the same data type, mixed data type is not supported (e.g., mxf8 x mxf4)
-* Mma tiler M must be 128 or 256(use_2cta_instrs)
-* Mma tiler N must be 128 or 256
-* Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-* Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
-* Cluster shape M must be multiple of 2 if Mma tiler M is 256(use_2cta_instrs)
-* The l mode(aka, batch size) for each group must be 1.
-* The majorness for A, B and C must be the same across all groups.
-* The contiguous dimension of A/B/C tensors in each group must be at least 16 bytes aligned,
-  i.e, number of elements is a multiple of 16 and 32 for Float8 and Float4, respectively.
-"""
 
 # =============================================================================
 # Tunables / configuration knobs
@@ -95,46 +60,15 @@ AB_DTYPE = cutlass.Float4E2M1FN
 SF_DTYPE = cutlass.Float8E4M3FN  # float8_e4m3fnuz for NVF4
 C_DTYPE = cutlass.Float16
 
-# Problem size caps (not used for scheduling, just metadata)
+_CLUSTER_SIZE = CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]
+_MAX_ACTIVE_CLUSTERS = max(1, SM_COUNT // _CLUSTER_SIZE)
+
 MAX_M = 512
 MAX_N = 7168
 MAX_K = 7168
 
 
 class Sm100GroupedBlockScaledGemmKernel:
-    """This example demonstrates an implementation of grouped blockscaled GEMM using a TMA plus Blackwell SM100 TensorCore
-    warp-specialized persistent kernel.
-
-    :param sf_vec_size: Scalefactor vector size.
-    :type sf_vec_size: int
-    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N)
-    :type mma_tiler_mn: Tuple[int, int]
-    :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
-    :type cluster_shape_mn: Tuple[int, int]
-
-    :note: In current version, A and B tensors must have the same data type
-        - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
-
-    :note: Supported combinations of A/B data types, SF data typs and SF vector size:
-        - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
-        - MXF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU + sf_vec_size: 32
-        - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN + sf_vec_size: 16
-
-    :note: Supported accumulator data types:
-        - Float32
-
-    :note: Supported C data types:
-        - Float32
-        - Float16/BFloat16
-        - Float8E4M3FN/Float8E5M2
-    :note: Constraints:
-        - MMA tiler M must be 128 or 256 (use_2cta_instrs)
-        - MMA tiler N must be 128/256
-        - Cluster shape M must be multiple of 2 if Mma tiler M is 256
-        - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-        - Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
-    """
-
     # Size of smem we reserved for mbarrier, tensor memory management and tensormap update
     reserved_smem_bytes = RESERVED_SMEM_BYTES
     bytes_per_tensormap = BYTES_PER_TENSORMAP
@@ -392,8 +326,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         by different tensors in global memory. The "initial" tensors only carry data type and
         majorness information.
 
-        :param group_count: The number of GEMM groups.
-        :type group_count: cutlass.Constexpr[int]
         :param problem_sizes_mnkl: (M, N, K, L) shape array for each group.
         :type problem_sizes_mnkl: cute.Tensor
         :param strides_abc: Strides for A, B, C for each group.
@@ -1384,7 +1316,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 self.cluster_tile_shape_mnk,
                 utils.create_initial_search_state(),
             )
-
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
@@ -1586,7 +1517,6 @@ class Sm100GroupedBlockScaledGemmKernel:
                 self.cluster_tile_shape_mnk,
                 utils.create_initial_search_state(),
             )
-
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
@@ -2491,48 +2421,68 @@ class Sm100GroupedBlockScaledGemmKernel:
         return can_implement
 
 
+# ---------------------------------------------------------------------------
+# Caches
+# ---------------------------------------------------------------------------
+_compiled_kernel_cache = {}   # compiled kernel per problem shape
+_metadata_cache = {}          # shape-derived GPU tensors per problem shape
+_data_ptr_cache = {}          # pointer tensors per data identity
+_DATA_PTR_CACHE_MAX = 64
 
-# Global cache for compiled kernels
-_compiled_kernel_cache = {}
-# Cache for per-shape metadata tensors
-_metadata_cache = {}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_CLUSTER_TILE_MN = tuple(
+    m * c for m, c in zip(MMA_TILER_MN, CLUSTER_SHAPE_MN)
+)
 
 
+def _count_clusters(problem_sizes):
+    """Total number of CTA clusters across all groups."""
+    total = 0
+    for m, n, _, _ in problem_sizes:
+        total += (
+            ((m + _CLUSTER_TILE_MN[0] - 1) // _CLUSTER_TILE_MN[0])
+            * ((n + _CLUSTER_TILE_MN[1] - 1) // _CLUSTER_TILE_MN[1])
+        )
+    return total
+
+
+def _make_ptr_tensors(abc_tensors, sfasfb_reordered_tensors):
+    """Build the small [G, 3] and [G, 2] int64 pointer tensors on GPU."""
+    abc_ptrs = [
+        [a.data_ptr(), b.data_ptr(), c.data_ptr()]
+        for a, b, c in abc_tensors
+    ]
+    sfasfb_ptrs = [
+        [sfa.data_ptr(), sfb.data_ptr()]
+        for sfa, sfb in sfasfb_reordered_tensors
+    ]
+    return (
+        torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda"),
+        torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kernel compilation (cached)
+# ---------------------------------------------------------------------------
 def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
-    """
-    Compile the kernel once and cache it using problem_sizes as the key.
-    """
-    global _compiled_kernel_cache
-
+    """Compile the kernel once and cache it keyed by problem_sizes."""
     num_groups = len(problem_sizes)
-    problem_sizes_tuple = tuple(tuple(ps) for ps in problem_sizes)
-    cache_key = (num_groups, problem_sizes_tuple)
+    cache_key = (num_groups, tuple(tuple(ps) for ps in problem_sizes))
 
     if cache_key in _compiled_kernel_cache:
         return _compiled_kernel_cache[cache_key]
 
     grouped_blockscaled_gemm = Sm100GroupedBlockScaledGemmKernel(
-        SF_VEC_SIZE,
-        MMA_TILER_MN,
-        CLUSTER_SHAPE_MN,
+        SF_VEC_SIZE, MMA_TILER_MN, CLUSTER_SHAPE_MN,
     )
 
-    hardware_info = cutlass.utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(
-        CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]
-    )
+    total_num_clusters = cutlass.Int32(_count_clusters(problem_sizes))
 
-    cta_tile_shape_mn = [MMA_TILER_MN[0], MMA_TILER_MN[1]]
-    cluster_tile_shape_mn = tuple(
-        x * y for x, y in zip(cta_tile_shape_mn, CLUSTER_SHAPE_MN)
-    )
-    total_num_clusters = 0
-    for m, n, _, _ in problem_sizes:
-        num_clusters_mn = tuple(
-            (x + y - 1) // y for x, y in zip((m, n), cluster_tile_shape_mn)
-        )
-        total_num_clusters += functools.reduce(lambda x, y: x * y, num_clusters_mn)
-
+    # Fake tensors for compilation signature
     problem_sizes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_groups, 4), stride_order=(1, 0)
     )
@@ -2547,16 +2497,13 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     )
     tensormap_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
-        (
-            SM_COUNT,
-            Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
-            Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8,
-        ),
+        (SM_COUNT,
+         Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
+         Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8),
         stride_order=(2, 1, 0),
     )
-    total_num_clusters = cutlass.Int32(total_num_clusters)
 
-    compiled_func = cute.compile[cute.GenerateLineInfo(True)](
+    compiled_func = cute.compile(
         grouped_blockscaled_gemm,
         num_groups,
         problem_sizes_fake,
@@ -2565,7 +2512,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
         ptrs_sfasfb_fake,
         tensormap_fake,
         total_num_clusters,
-        max_active_clusters,
+        _MAX_ACTIVE_CLUSTERS,
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
@@ -2573,80 +2520,81 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     return compiled_func
 
 
+# ---------------------------------------------------------------------------
+# Shape metadata (cached)
+# ---------------------------------------------------------------------------
+def _get_or_build_metadata(problem_sizes, problem_sizes_key):
+    """Return cached (or freshly built) shape-derived GPU tensors."""
+    cached = _metadata_cache.get(problem_sizes_key)
+    if cached is not None:
+        return cached
+
+    tensor_of_problem_sizes = torch.tensor(
+        problem_sizes, dtype=torch.int32, device="cuda"
+    )
+    strides_abc = [[(k, 1), (k, 1), (n, 1)] for _, n, k, _ in problem_sizes]
+    tensor_of_strides_abc = torch.tensor(
+        strides_abc, dtype=torch.int32, device="cuda"
+    )
+    tensor_of_tensormap = torch.empty(
+        (SM_COUNT,
+         Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
+         Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8),
+        dtype=torch.int64, device="cuda",
+    )
+    total_num_clusters = _count_clusters(problem_sizes)
+
+    result = (
+        tensor_of_problem_sizes,
+        tensor_of_strides_abc,
+        tensor_of_tensormap,
+        total_num_clusters,
+    )
+    _metadata_cache[problem_sizes_key] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pointer tensors (cached by data identity)
+# ---------------------------------------------------------------------------
+def _get_or_build_ptrs(data_id, first_ptr, problem_sizes_key,
+                       abc_tensors, sfasfb_reordered_tensors):
+    """Return cached (or freshly built) pointer tensors."""
+    cached = _data_ptr_cache.get(data_id)
+    if cached is not None:
+        cf, ck, t_abc, t_sf = cached
+        if cf == first_ptr and ck == problem_sizes_key:
+            return t_abc, t_sf
+
+    t_abc, t_sf = _make_ptr_tensors(abc_tensors, sfasfb_reordered_tensors)
+
+    if len(_data_ptr_cache) >= _DATA_PTR_CACHE_MAX:
+        _data_ptr_cache.pop(next(iter(_data_ptr_cache)))
+    _data_ptr_cache[data_id] = (first_ptr, problem_sizes_key, t_abc, t_sf)
+
+    return t_abc, t_sf
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def custom_kernel(data: input_t) -> output_t:
-    """
-    Execute the block-scaled group GEMM kernel.
-    """
+    """Execute the block-scaled group GEMM kernel."""
     abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
     num_groups = len(problem_sizes)
+    problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
 
     compiled_func = compile_kernel(problem_sizes)
 
-    abc_ptrs = []
-    sfasfb_ptrs = []
-    strides_abc = []
-    for (a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l) in zip(
-        abc_tensors, sfasfb_reordered_tensors, problem_sizes
-    ):
-        abc_ptrs.append([a.data_ptr(), b.data_ptr(), c.data_ptr()])
-        sfasfb_ptrs.append([sfa_reordered.data_ptr(), sfb_reordered.data_ptr()])
-        # Use logical strides in (m,n,k,l) space (matches kernel expectations)
-        strides_abc.append([(k, 1), (k, 1), (n, 1)])
+    (tensor_of_problem_sizes,
+     tensor_of_strides_abc,
+     tensor_of_tensormap,
+     total_num_clusters) = _get_or_build_metadata(problem_sizes, problem_sizes_key)
 
-    problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
-    cached_meta = _metadata_cache.get(problem_sizes_key)
-    if cached_meta is None:
-        tensor_of_problem_sizes = torch.tensor(
-            problem_sizes, dtype=torch.int32, device="cuda"
-        )
-        tensor_of_strides_abc = torch.tensor(
-            strides_abc, dtype=torch.int32, device="cuda"
-        )
-
-        cta_tile_shape_mn = [128, MMA_TILER_MN[1]]
-        cluster_tile_shape_mn = tuple(
-            x * y for x, y in zip(cta_tile_shape_mn, CLUSTER_SHAPE_MN)
-        )
-        total_num_clusters = 0
-        for m, n, _, _ in problem_sizes:
-            num_clusters_mn = tuple(
-                (x + y - 1) // y for x, y in zip((m, n), cluster_tile_shape_mn)
-            )
-            total_num_clusters += functools.reduce(lambda x, y: x * y, num_clusters_mn)
-
-        hardware_info = cutlass.utils.HardwareInfo()
-        sm_count = SM_COUNT
-        max_active_clusters = hardware_info.get_max_active_clusters(
-            CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]
-        )
-        tensormap_shape = (
-            sm_count,
-            Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
-            Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8,
-        )
-        tensor_of_tensormap = torch.empty(
-            tensormap_shape, dtype=torch.int64, device="cuda"
-        )
-
-        cached_meta = (
-            tensor_of_problem_sizes,
-            tensor_of_strides_abc,
-            tensor_of_tensormap,
-            total_num_clusters,
-            max_active_clusters,
-        )
-        _metadata_cache[problem_sizes_key] = cached_meta
-    else:
-        (
-            tensor_of_problem_sizes,
-            tensor_of_strides_abc,
-            tensor_of_tensormap,
-            total_num_clusters,
-            max_active_clusters,
-        ) = cached_meta
-
-    tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
-    tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
+    tensor_of_abc_ptrs, tensor_of_sfasfb_ptrs = _get_or_build_ptrs(
+        id(data), abc_tensors[0][0].data_ptr(), problem_sizes_key,
+        abc_tensors, sfasfb_reordered_tensors,
+    )
 
     compiled_func(
         tensor_of_problem_sizes,
