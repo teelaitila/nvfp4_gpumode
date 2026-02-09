@@ -2439,7 +2439,6 @@ _CLUSTER_TILE_MN = tuple(
 
 
 def _count_clusters(problem_sizes):
-    """Total number of CTA clusters across all groups."""
     total = 0
     for m, n, _, _ in problem_sizes:
         total += (
@@ -2450,7 +2449,6 @@ def _count_clusters(problem_sizes):
 
 
 def _make_ptr_tensors(abc_tensors, sfasfb_reordered_tensors):
-    """Build the small [G, 3] and [G, 2] int64 pointer tensors on GPU."""
     abc_ptrs = [
         [a.data_ptr(), b.data_ptr(), c.data_ptr()]
         for a, b, c in abc_tensors
