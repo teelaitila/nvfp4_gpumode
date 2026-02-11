@@ -2448,6 +2448,21 @@ def _count_clusters(problem_sizes):
     return total
 
 
+def _count_clusters_for_tiler(problem_sizes, mma_tiler_mn, cluster_shape_mn):
+    """Cluster count for a given (mma_tiler_mn, cluster_shape_mn)."""
+    cluster_tile_mn = (
+        mma_tiler_mn[0] * cluster_shape_mn[0],
+        mma_tiler_mn[1] * cluster_shape_mn[1],
+    )
+    total = 0
+    for m, n, _, _ in problem_sizes:
+        total += (
+            ((m + cluster_tile_mn[0] - 1) // cluster_tile_mn[0])
+            * ((n + cluster_tile_mn[1] - 1) // cluster_tile_mn[1])
+        )
+    return total
+
+
 def _make_ptr_tensors(abc_tensors, sfasfb_reordered_tensors):
     abc_ptrs = [
         [a.data_ptr(), b.data_ptr(), c.data_ptr()]
@@ -2467,18 +2482,25 @@ def _make_ptr_tensors(abc_tensors, sfasfb_reordered_tensors):
 # Kernel compilation (cached)
 # ---------------------------------------------------------------------------
 def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
-    """Compile the kernel once and cache it keyed by problem_sizes."""
+    """Compile the kernel once and cache it keyed by num_groups and tiler variant. """
     num_groups = len(problem_sizes)
-    cache_key = (num_groups, tuple(tuple(ps) for ps in problem_sizes))
+    all_n_7168 = all(n == 7168 for _, n, _, _ in problem_sizes)
+    mma_tiler_mn = (128, 256) if all_n_7168 else MMA_TILER_MN
+    cluster_shape_mn = CLUSTER_SHAPE_MN  # (1, 1)
+
+    cache_key = (num_groups, all_n_7168)
 
     if cache_key in _compiled_kernel_cache:
         return _compiled_kernel_cache[cache_key]
 
     grouped_blockscaled_gemm = Sm100GroupedBlockScaledGemmKernel(
-        SF_VEC_SIZE, MMA_TILER_MN, CLUSTER_SHAPE_MN,
+        SF_VEC_SIZE, mma_tiler_mn, cluster_shape_mn,
     )
 
-    total_num_clusters = cutlass.Int32(_count_clusters(problem_sizes))
+    total_num_clusters = cutlass.Int32(
+        _count_clusters_for_tiler(problem_sizes, mma_tiler_mn, cluster_shape_mn)
+    )
+    max_active_clusters = SM_COUNT // (cluster_shape_mn[0] * cluster_shape_mn[1])
 
     # Fake tensors for compilation signature
     problem_sizes_fake = cute.runtime.make_fake_compact_tensor(
@@ -2510,7 +2532,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
         ptrs_sfasfb_fake,
         tensormap_fake,
         total_num_clusters,
-        _MAX_ACTIVE_CLUSTERS,
+        max_active_clusters,
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
@@ -2587,7 +2609,14 @@ def custom_kernel(data: input_t) -> output_t:
     (tensor_of_problem_sizes,
      tensor_of_strides_abc,
      tensor_of_tensormap,
-     total_num_clusters) = _get_or_build_metadata(problem_sizes, problem_sizes_key)
+     _) = _get_or_build_metadata(problem_sizes, problem_sizes_key)
+
+
+    all_n_7168 = all(n == 7168 for _, n, _, _ in problem_sizes)
+    mma_tiler_mn = (128, 256) if all_n_7168 else MMA_TILER_MN
+    total_num_clusters = _count_clusters_for_tiler(
+        problem_sizes, mma_tiler_mn, CLUSTER_SHAPE_MN
+    )
 
     tensor_of_abc_ptrs, tensor_of_sfasfb_ptrs = _get_or_build_ptrs(
         id(data), abc_tensors[0][0].data_ptr(), problem_sizes_key,
