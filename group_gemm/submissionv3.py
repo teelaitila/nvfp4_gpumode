@@ -1,6 +1,9 @@
 import subprocess
 import sys
+import os
 
+
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 def install_package():
     """Install dependencies using pip"""
@@ -48,6 +51,10 @@ CLUSTER_SHAPE_MN = (1, 1)  # Cluster shape (M, N) for N multicast
 DEFAULT_OCCUPANCY = 1  # Target CTAs per SM
 TMEM_ALLOC_COLS = 512  # TMEM columns allocated per CTA
 SM_COUNT = 148  # B200 SM count for tensormap storage
+TENSORMAP_WORKSPACE_SLOTS = 4096
+_TMA_CACHE_EVICT_NORMAL = 0x1000000000000000
+_TMA_CACHE_EVICT_FIRST = 0x12F0000000000000
+_TMA_CACHE_EVICT_LAST = 0x14F0000000000000
 
 # SMEM bookkeeping (tensormap + barriers + tmem mgmt)
 RESERVED_SMEM_BYTES = 1024
@@ -81,6 +88,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        cache_policy: int,
     ):
         """Initializes the configuration for a Blackwell grouped blockscaled GEMM kernel.
 
@@ -105,6 +113,8 @@ class Sm100GroupedBlockScaledGemmKernel:
         )
 
         self.tensormap_update_mode = utils.TensorMapUpdateMode.SMEM
+        # TMA cache hint (ported from dualgemmex tuning).
+        self.cache_policy = cache_policy
 
         self.occupancy = DEFAULT_OCCUPANCY
         # Set specialized warp ids
@@ -312,8 +322,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         ptrs_abc: cute.Tensor,
         ptrs_sfasfb: cute.Tensor,
         tensormap_cute_tensor: cute.Tensor,
-        total_num_clusters: cutlass.Int32,
-        max_active_clusters: cutlass.Constexpr[int],
+        total_num_clusters: cutlass.Constexpr[int],
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -337,9 +346,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         :param tensormap_cute_tensor: Tensormap storage tensor.
         :type tensormap_cute_tensor: cute.Tensor
         :param total_num_clusters: Total number of clusters needed for all groups.
-        :type total_num_clusters: cutlass.Int32
-        :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr[int]
+        :type total_num_clusters: cutlass.Constexpr[int]
         :raises TypeError: If A and B data types do not match.
         """
         self.a_dtype = AB_DTYPE
@@ -362,7 +369,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         tensormap_cute_tensor = cute.make_tensor(
             tensormap_cute_tensor.iterator,
             cute.make_layout(
-                (total_num_clusters, self.num_tensormaps, 16),
+                (TENSORMAP_WORKSPACE_SLOTS, self.num_tensormaps, 16),
                 stride=(self.num_tensormaps * 16, 16, 1),
             ),
         )
@@ -997,6 +1004,9 @@ class Sm100GroupedBlockScaledGemmKernel:
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
+            tma_cache_policy = cutlass.Int64(
+                cutlass.Int64(self.cache_policy).ir_value()
+            )
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
@@ -1144,6 +1154,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tensormap_a_gmem_ptr,
                             cute.AddressSpace.generic,
                         ),
+                        cache_policy=tma_cache_policy,
                     )
                     cute.copy(
                         tma_atom_b,
@@ -1155,6 +1166,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tensormap_b_gmem_ptr,
                             cute.AddressSpace.generic,
                         ),
+                        cache_policy=tma_cache_policy,
                     )
                     cute.copy(
                         tma_atom_sfa,
@@ -1166,6 +1178,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tensormap_sfa_gmem_ptr,
                             cute.AddressSpace.generic,
                         ),
+                        cache_policy=tma_cache_policy,
                     )
                     cute.copy(
                         tma_atom_sfb,
@@ -1177,6 +1190,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             tensormap_sfb_gmem_ptr,
                             cute.AddressSpace.generic,
                         ),
+                        cache_policy=tma_cache_policy,
                     )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
@@ -2132,9 +2146,6 @@ class Sm100GroupedBlockScaledGemmKernel:
         :type total_num_clusters: int
         :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
         :type cluster_shape_mn: tuple[int, int]
-        :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr[int]
-
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
             - grid: Grid shape for kernel launch.
@@ -2463,6 +2474,35 @@ def _count_clusters_for_tiler(problem_sizes, mma_tiler_mn, cluster_shape_mn):
     return total
 
 
+def _select_tma_cache_policy(problem_sizes: List[Tuple[int, int, int, int]]) -> int:
+    """Shape-based cache hint policy.
+
+    Target behavior requested:
+    - First two benchmark groups (g=8) => evict normal
+    - Last two benchmark groups (g=2) => evict first
+    """
+    num_groups = len(problem_sizes)
+    ns = tuple(n for _, n, _, _ in problem_sizes)
+    ks = tuple(k for _, _, k, _ in problem_sizes)
+
+    # Benchmark group 1 and 2 signatures
+    if num_groups == 8 and (
+        (all(n == 4096 for n in ns) and all(k == 7168 for k in ks))
+        or (all(n == 7168 for n in ns) and all(k == 2048 for k in ks))
+    ):
+        return _TMA_CACHE_EVICT_NORMAL
+
+    # Benchmark group 3 and 4 signatures
+    if num_groups == 2 and (
+        (all(n == 3072 for n in ns) and all(k == 4096 for k in ks))
+        or (all(n == 4096 for n in ns) and all(k == 1536 for k in ks))
+    ):
+        return _TMA_CACHE_EVICT_FIRST
+
+    # Safe default
+    return _TMA_CACHE_EVICT_NORMAL
+
+
 def _make_ptr_tensors(abc_tensors, sfasfb_reordered_tensors):
     abc_ptrs = [
         [a.data_ptr(), b.data_ptr(), c.data_ptr()]
@@ -2482,26 +2522,39 @@ def _make_ptr_tensors(abc_tensors, sfasfb_reordered_tensors):
 # Kernel compilation (cached)
 # ---------------------------------------------------------------------------
 def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
-    """Compile the kernel once and cache it keyed by num_groups and tiler variant. """
+    """Compile the kernel once and cache it by full compile-affecting configuration."""
     num_groups = len(problem_sizes)
     all_n_7168 = all(n == 7168 for _, n, _, _ in problem_sizes)
     mma_tiler_mn = (128, 256) if all_n_7168 else MMA_TILER_MN
     cluster_shape_mn = CLUSTER_SHAPE_MN  # (1, 1)
+    cache_policy = _select_tma_cache_policy(problem_sizes)
+    problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
+    total_num_clusters = _count_clusters_for_tiler(
+        problem_sizes, mma_tiler_mn, cluster_shape_mn
+    )
+    required_cta_slots = total_num_clusters * (cluster_shape_mn[0] * cluster_shape_mn[1])
+    if required_cta_slots > TENSORMAP_WORKSPACE_SLOTS:
+        raise ValueError(
+            f"tensormap workspace too small: need {required_cta_slots} CTA slots, "
+            f"have {TENSORMAP_WORKSPACE_SLOTS}"
+        )
 
-    cache_key = (num_groups, all_n_7168)
+    cache_key = (
+        num_groups,
+        all_n_7168,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        cache_policy,
+        problem_sizes_key,
+        total_num_clusters,
+    )
 
     if cache_key in _compiled_kernel_cache:
         return _compiled_kernel_cache[cache_key]
 
     grouped_blockscaled_gemm = Sm100GroupedBlockScaledGemmKernel(
-        SF_VEC_SIZE, mma_tiler_mn, cluster_shape_mn,
+        SF_VEC_SIZE, mma_tiler_mn, cluster_shape_mn, cache_policy,
     )
-
-    total_num_clusters = cutlass.Int32(
-        _count_clusters_for_tiler(problem_sizes, mma_tiler_mn, cluster_shape_mn)
-    )
-    max_active_clusters = SM_COUNT // (cluster_shape_mn[0] * cluster_shape_mn[1])
-
     # Fake tensors for compilation signature
     problem_sizes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_groups, 4), stride_order=(1, 0)
@@ -2517,7 +2570,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     )
     tensormap_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64,
-        (SM_COUNT,
+        (TENSORMAP_WORKSPACE_SLOTS,
          Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
          Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8),
         stride_order=(2, 1, 0),
@@ -2532,7 +2585,6 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
         ptrs_sfasfb_fake,
         tensormap_fake,
         total_num_clusters,
-        max_active_clusters,
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
@@ -2557,7 +2609,7 @@ def _get_or_build_metadata(problem_sizes, problem_sizes_key):
         strides_abc, dtype=torch.int32, device="cuda"
     )
     tensor_of_tensormap = torch.empty(
-        (SM_COUNT,
+        (TENSORMAP_WORKSPACE_SLOTS,
          Sm100GroupedBlockScaledGemmKernel.num_tensormaps,
          Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8),
         dtype=torch.int64, device="cuda",
@@ -2600,36 +2652,48 @@ def _get_or_build_ptrs(data_id, first_ptr, problem_sizes_key,
 # ---------------------------------------------------------------------------
 def custom_kernel(data: input_t) -> output_t:
     """Execute the block-scaled group GEMM kernel."""
-    abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
-    num_groups = len(problem_sizes)
-    problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
+    try:
+        abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
+        num_groups = len(problem_sizes)
+        problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
 
-    compiled_func = compile_kernel(problem_sizes)
+        compiled_func = compile_kernel(problem_sizes)
 
-    (tensor_of_problem_sizes,
-     tensor_of_strides_abc,
-     tensor_of_tensormap,
-     _) = _get_or_build_metadata(problem_sizes, problem_sizes_key)
+        (tensor_of_problem_sizes,
+         tensor_of_strides_abc,
+         tensor_of_tensormap,
+         _) = _get_or_build_metadata(problem_sizes, problem_sizes_key)
 
+        all_n_7168 = all(n == 7168 for _, n, _, _ in problem_sizes)
+        mma_tiler_mn = (128, 256) if all_n_7168 else MMA_TILER_MN
+        total_num_clusters = _count_clusters_for_tiler(
+            problem_sizes, mma_tiler_mn, CLUSTER_SHAPE_MN
+        )
+        required_cta_slots = total_num_clusters * (
+            CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]
+        )
+        if required_cta_slots > TENSORMAP_WORKSPACE_SLOTS:
+            raise ValueError(
+                f"tensormap workspace too small: need {required_cta_slots} CTA slots, "
+                f"have {TENSORMAP_WORKSPACE_SLOTS}"
+            )
 
-    all_n_7168 = all(n == 7168 for _, n, _, _ in problem_sizes)
-    mma_tiler_mn = (128, 256) if all_n_7168 else MMA_TILER_MN
-    total_num_clusters = _count_clusters_for_tiler(
-        problem_sizes, mma_tiler_mn, CLUSTER_SHAPE_MN
-    )
+        tensor_of_abc_ptrs, tensor_of_sfasfb_ptrs = _get_or_build_ptrs(
+            id(data), abc_tensors[0][0].data_ptr(), problem_sizes_key,
+            abc_tensors, sfasfb_reordered_tensors,
+        )
 
-    tensor_of_abc_ptrs, tensor_of_sfasfb_ptrs = _get_or_build_ptrs(
-        id(data), abc_tensors[0][0].data_ptr(), problem_sizes_key,
-        abc_tensors, sfasfb_reordered_tensors,
-    )
+        compiled_func(
+            tensor_of_problem_sizes,
+            tensor_of_strides_abc,
+            tensor_of_abc_ptrs,
+            tensor_of_sfasfb_ptrs,
+            tensor_of_tensormap,
+        )
+        # torch.cuda.synchronize()
 
-    compiled_func(
-        tensor_of_problem_sizes,
-        tensor_of_strides_abc,
-        tensor_of_abc_ptrs,
-        tensor_of_sfasfb_ptrs,
-        tensor_of_tensormap,
-        total_num_clusters,
-    )
-
-    return [abc_tensors[i][2] for i in range(num_groups)]
+        return [abc_tensors[i][2] for i in range(num_groups)]
+    except Exception as e:
+        # Benchmark harness uses multiprocessing; rethrow as a plain Python exception
+        # so backend ffi/tvm errors are serializable across process boundaries.
+        raise RuntimeError(f"custom_kernel failed: {type(e).__name__}: {e}") from None
