@@ -154,3 +154,7 @@ more for many small grouped GEMMs.
 ### Notes
 CLC dynamic scheduling improves performance especially for grouped GEMMs with varying tile counts.
 The dynamic load balancing avoids idle SMs waiting for slower groups to finish.
+
+
+
+cache evict first improves perf 
