@@ -844,7 +844,9 @@ class Sm100GroupedBlockScaledGemmKernel:
         )
         # (bN, bK, RestN, RestK, RestL)
         gSFB_nkl = cute.local_tile(
-            mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            mSFB_nkl,
+            cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+            (None, None, None),
         )
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(
@@ -1117,9 +1119,10 @@ class Sm100GroupedBlockScaledGemmKernel:
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
                 ]
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
-                ]
+                slice_n = mma_tile_coord_mnl[1]
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    slice_n = mma_tile_coord_mnl[1] // 2
+                tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
@@ -1338,14 +1341,26 @@ class Sm100GroupedBlockScaledGemmKernel:
             )
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                # MMA warp is only interested in number of tiles along K dimension
-                (
-                    cur_k_tile_cnt,
-                    cur_group_idx,
-                ) = group_gemm_ts_helper.search_cluster_tile_count_k(
+                grouped_gemm_cta_tile_info = group_gemm_ts_helper.delinearize_z(
                     cur_tile_coord,
                     problem_sizes_mnkl,
                 )
+                cur_k_tile_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
+                cur_group_idx = grouped_gemm_cta_tile_info.group_idx
+                cur_tile_idx_n = grouped_gemm_cta_tile_info.cta_tile_idx_n
+
+                tCtSFB_mma = tCtSFB
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    # For N=64 path, SFB tiles are packed for 128-wide indexing.
+                    offset = cutlass.Int32((cur_tile_idx_n % 2) * 2)
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr
+                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
+                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                        + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
 
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
@@ -1418,7 +1433,7 @@ class Sm100GroupedBlockScaledGemmKernel:
                             )
                             tiled_mma.set(
                                 tcgen05.Field.SFB,
-                                tCtSFB[sf_kblock_coord].iterator,
+                                tCtSFB_mma[sf_kblock_coord].iterator,
                             )
 
                             cute.gemm(
@@ -2191,245 +2206,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             ]
         )
         return mbar_smem_consumption
-
-    @staticmethod
-    def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
-    ) -> bool:
-        """
-        Check if the dtypes and sf_vec_size are valid combinations
-
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param sf_dtype: The data type of the scale factor
-        :type sf_dtype: Type[cutlass.Numeric]
-        :param sf_vec_size: The vector size of the scale factor
-        :type sf_vec_size: int
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-
-        :return: True if the dtypes and sf_vec_size are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        # Check valid ab_dtype
-        if ab_dtype not in {
-            cutlass.Float4E2M1FN,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
-
-        # Check valid sf_vec_size
-        if sf_vec_size not in {16, 32}:
-            is_valid = False
-
-        # Check valid sf_dtype
-        if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
-            is_valid = False
-
-        # Check valid sf_dtype and sf_vec_size combinations
-        if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
-            is_valid = False
-        if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
-            is_valid = False
-
-        # Check valid c_dtype
-        if c_dtype not in {
-            cutlass.Float32,
-            cutlass.Float16,
-            cutlass.BFloat16,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
-
-        return is_valid
-
-    @staticmethod
-    def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """
-        Check if layouts and dtypes are valid combinations
-
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: The major dimension of the A tensor
-        :type a_major: str
-        :param b_major: The major dimension of the B tensor
-        :type b_major: str
-        :param c_major: The major dimension of the C tensor
-        :type c_major: str
-
-        :return: True if the layouts are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
-            is_valid = False
-        return is_valid
-
-    @staticmethod
-    def is_valid_mma_tiler_and_cluster_shape(
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-    ) -> bool:
-        """
-        Check if the mma tiler and cluster shape are valid
-
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
-        :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
-        :type cluster_shape_mn: Tuple[int, int]
-
-        :return: True if the mma tiler and cluster shape are valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-        # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in [128, 256]:
-            is_valid = False
-        if mma_tiler_mn[1] not in [128, 256]:
-            is_valid = False
-        # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
-            is_valid = False
-        # Skip invalid cluster shape
-        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
-        if (
-            cluster_shape_mn[0] * cluster_shape_mn[1] > 16
-            or cluster_shape_mn[0] <= 0
-            or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
-        ):
-            is_valid = False
-        return is_valid
-
-    @staticmethod
-    def is_valid_tensor_alignment(
-        problem_sizes_mnkl: List[Tuple[int, int, int, int]],
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """
-        Check if the tensor alignment is valid
-
-        :param problem_sizes_mnkl: The problem shape for each group
-        :type problem_sizes_mnkl: List[Tuple[int, int, int, int]]
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: The major axis of the A tensor
-        :type a_major: str
-        :param b_major: The major axis of the B tensor
-        :type b_major: str
-        :param c_major: The major axis of the C tensor
-        :type c_major: str
-
-        :return: True if the problem shape is valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
-            return num_major_elements % num_contiguous_elements == 0
-
-        for m, n, k, l in problem_sizes_mnkl:
-            if (
-                not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
-                or not check_contigous_16B_alignment(
-                    ab_dtype, b_major == "n", (n, k, l)
-                )
-                or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
-            ):
-                is_valid = False
-        return is_valid
-
-    @staticmethod
-    def can_implement(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        problem_sizes_mnkl: List[Tuple[int, int, int, int]],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """
-        Check if the gemm can be implemented
-
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param sf_dtype: The data type of the scale factor tensor
-        :type sf_dtype: Type[cutlass.Numeric]
-        :param sf_vec_size: The vector size
-        :type sf_vec_size: int
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
-        :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
-        :type cluster_shape_mn: Tuple[int, int]
-
-        :param a_major: The major axis of the A tensor
-        :type a_major: str
-        :param b_major: The major axis of the B tensor
-        :type b_major: str
-        :param c_major: The major axis of the C tensor
-        :type c_major: str
-
-        :return: True if the gemm can be implemented, False otherwise
-        :rtype: bool
-        """
-        can_implement = True
-        # Skip unsupported types
-        if not Sm100GroupedBlockScaledGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, c_dtype
-        ):
-            can_implement = False
-        # Skip unsupported layouts
-        if not Sm100GroupedBlockScaledGemmKernel.is_valid_layouts(
-            ab_dtype, c_dtype, a_major, b_major, c_major
-        ):
-            can_implement = False
-        # Skip invalid mma tile shape and cluster shape
-        if not Sm100GroupedBlockScaledGemmKernel.is_valid_mma_tiler_and_cluster_shape(
-            mma_tiler_mn, cluster_shape_mn
-        ):
-            can_implement = False
-        # Skip illegal problem shape for load/store alignment
-        if not Sm100GroupedBlockScaledGemmKernel.is_valid_tensor_alignment(
-            problem_sizes_mnkl, ab_dtype, c_dtype, a_major, b_major, c_major
-        ):
-            can_implement = False
-        return can_implement
 
 
 # ---------------------------------------------------------------------------
