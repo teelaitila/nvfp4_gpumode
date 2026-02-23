@@ -318,6 +318,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         self,
         group_count: cutlass.Constexpr[int],
         problem_sizes_mnkl: cute.Tensor,
+        prefix_group_num_clusters: cute.Tensor,
         strides_abc: cute.Tensor,
         ptrs_abc: cute.Tensor,
         ptrs_sfasfb: cute.Tensor,
@@ -337,6 +338,8 @@ class Sm100GroupedBlockScaledGemmKernel:
 
         :param problem_sizes_mnkl: (M, N, K, L) shape array for each group.
         :type problem_sizes_mnkl: cute.Tensor
+        :param prefix_group_num_clusters: Prefix-sum cluster offsets per group, shape (group_count + 1,).
+        :type prefix_group_num_clusters: cute.Tensor
         :param strides_abc: Strides for A, B, C for each group.
         :type strides_abc: cute.Tensor
         :param ptrs_abc: Base addresses for A, B, C for each group.
@@ -621,6 +624,7 @@ class Sm100GroupedBlockScaledGemmKernel:
             self.tile_sched_params,
             group_count,
             problem_shape_mnkl,
+            prefix_group_num_clusters,
             strides_abc,
             tensor_address_abc,
             tensor_address_sfasfb,
@@ -661,6 +665,7 @@ class Sm100GroupedBlockScaledGemmKernel:
         tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         group_count: cutlass.Constexpr,
         problem_sizes_mnkl: cute.Tensor,
+        prefix_group_num_clusters: cute.Tensor,
         strides_abc: cute.Tensor,
         ptrs_abc: cute.Tensor,
         ptrs_sfasfb: cute.Tensor,
@@ -992,13 +997,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            # grouped gemm tile scheduler helper will compute the group index for the tile we're working on
-            group_gemm_ts_helper = utils.GroupedGemmTileSchedulerHelper(
-                group_count,
-                tile_sched_params,
-                self.cluster_tile_shape_mnk,
-                utils.create_initial_search_state(),
-            )
             tensormap_init_done = cutlass.Boolean(False)
             # group index of last tile
             last_group_idx = cutlass.Int32(-1)
@@ -1012,12 +1010,20 @@ class Sm100GroupedBlockScaledGemmKernel:
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                grouped_gemm_cta_tile_info = group_gemm_ts_helper.delinearize_z(
+                (
+                    cur_group_idx,
+                    problem_shape_m,
+                    problem_shape_n,
+                    problem_shape_k,
+                    cta_tile_idx_m,
+                    cta_tile_idx_n,
+                    cur_k_tile_cnt,
+                ) = self.dispatch_tile_info_from_prefix(
                     cur_tile_coord,
+                    group_count,
                     problem_sizes_mnkl,
+                    prefix_group_num_clusters,
                 )
-                cur_k_tile_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
-                cur_group_idx = grouped_gemm_cta_tile_info.group_idx
                 is_group_changed = cur_group_idx != last_group_idx
                 # skip tensormap update if we're working on the same group
                 if is_group_changed:
@@ -1025,9 +1031,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cur_group_idx,
                         self.a_dtype,
                         (
-                            grouped_gemm_cta_tile_info.problem_shape_m,
-                            grouped_gemm_cta_tile_info.problem_shape_n,
-                            grouped_gemm_cta_tile_info.problem_shape_k,
+                            problem_shape_m,
+                            problem_shape_n,
+                            problem_shape_k,
                         ),
                         strides_abc,
                         ptrs_abc,
@@ -1037,9 +1043,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cur_group_idx,
                         self.b_dtype,
                         (
-                            grouped_gemm_cta_tile_info.problem_shape_m,
-                            grouped_gemm_cta_tile_info.problem_shape_n,
-                            grouped_gemm_cta_tile_info.problem_shape_k,
+                            problem_shape_m,
+                            problem_shape_n,
+                            problem_shape_k,
                         ),
                         strides_abc,
                         ptrs_abc,
@@ -1049,9 +1055,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cur_group_idx,
                         self.sf_dtype,
                         (
-                            grouped_gemm_cta_tile_info.problem_shape_m,
-                            grouped_gemm_cta_tile_info.problem_shape_n,
-                            grouped_gemm_cta_tile_info.problem_shape_k,
+                            problem_shape_m,
+                            problem_shape_n,
+                            problem_shape_k,
                         ),
                         ptrs_sfasfb,
                         0,  # 0 for tensor SFA
@@ -1060,9 +1066,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cur_group_idx,
                         self.sf_dtype,
                         (
-                            grouped_gemm_cta_tile_info.problem_shape_m,
-                            grouped_gemm_cta_tile_info.problem_shape_n,
-                            grouped_gemm_cta_tile_info.problem_shape_k,
+                            problem_shape_m,
+                            problem_shape_n,
+                            problem_shape_k,
                         ),
                         ptrs_sfasfb,
                         1,  # 1 for tensor SFB
@@ -1096,9 +1102,8 @@ class Sm100GroupedBlockScaledGemmKernel:
                     )
 
                 mma_tile_coord_mnl = (
-                    grouped_gemm_cta_tile_info.cta_tile_idx_m
-                    // cute.size(tiled_mma.thr_id.shape),
-                    grouped_gemm_cta_tile_info.cta_tile_idx_n,
+                    cta_tile_idx_m // cute.size(tiled_mma.thr_id.shape),
+                    cta_tile_idx_n,
                     0,
                 )
 
@@ -1326,13 +1331,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            # grouped gemm tile scheduler helper will compute the group index for the tile we're working on
-            group_gemm_ts_helper = utils.GroupedGemmTileSchedulerHelper(
-                group_count,
-                tile_sched_params,
-                self.cluster_tile_shape_mnk,
-                utils.create_initial_search_state(),
-            )
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
@@ -1341,13 +1339,21 @@ class Sm100GroupedBlockScaledGemmKernel:
             )
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                grouped_gemm_cta_tile_info = group_gemm_ts_helper.delinearize_z(
+                (
+                    cur_group_idx,
+                    _problem_shape_m,
+                    _problem_shape_n,
+                    _problem_shape_k,
+                    cta_tile_idx_m,
+                    cta_tile_idx_n,
+                    cur_k_tile_cnt,
+                ) = self.dispatch_tile_info_from_prefix(
                     cur_tile_coord,
+                    group_count,
                     problem_sizes_mnkl,
+                    prefix_group_num_clusters,
                 )
-                cur_k_tile_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
-                cur_group_idx = grouped_gemm_cta_tile_info.group_idx
-                cur_tile_idx_n = grouped_gemm_cta_tile_info.cta_tile_idx_n
+                cur_tile_idx_n = cta_tile_idx_n
 
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
@@ -1539,13 +1545,6 @@ class Sm100GroupedBlockScaledGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            # grouped gemm tile scheduler helper will compute the group index for the tile we're working on
-            group_gemm_ts_helper = utils.GroupedGemmTileSchedulerHelper(
-                group_count,
-                tile_sched_params,
-                self.cluster_tile_shape_mnk,
-                utils.create_initial_search_state(),
-            )
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
@@ -1564,11 +1563,20 @@ class Sm100GroupedBlockScaledGemmKernel:
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                grouped_gemm_cta_tile_info = group_gemm_ts_helper.delinearize_z(
+                (
+                    cur_group_idx,
+                    problem_shape_m,
+                    problem_shape_n,
+                    problem_shape_k,
+                    cta_tile_idx_m,
+                    cta_tile_idx_n,
+                    cta_tile_count_k,
+                ) = self.dispatch_tile_info_from_prefix(
                     cur_tile_coord,
+                    group_count,
                     problem_sizes_mnkl,
+                    prefix_group_num_clusters,
                 )
-                cur_group_idx = grouped_gemm_cta_tile_info.group_idx
                 is_group_changed = cur_group_idx != last_group_idx
 
                 if is_group_changed:
@@ -1577,9 +1585,9 @@ class Sm100GroupedBlockScaledGemmKernel:
                         cur_group_idx,
                         self.c_dtype,
                         (
-                            grouped_gemm_cta_tile_info.problem_shape_m,
-                            grouped_gemm_cta_tile_info.problem_shape_n,
-                            grouped_gemm_cta_tile_info.problem_shape_k,
+                            problem_shape_m,
+                            problem_shape_n,
+                            problem_shape_k,
                         ),
                         strides_abc,
                         ptrs_abc,
@@ -1594,12 +1602,11 @@ class Sm100GroupedBlockScaledGemmKernel:
                     )
 
                 mma_tile_coord_mnl = (
-                    grouped_gemm_cta_tile_info.cta_tile_idx_m
-                    // cute.size(tiled_mma.thr_id.shape),
-                    grouped_gemm_cta_tile_info.cta_tile_idx_n,
+                    cta_tile_idx_m // cute.size(tiled_mma.thr_id.shape),
+                    cta_tile_idx_n,
                     0,
                 )
-                cur_k_tile_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
+                cur_k_tile_cnt = cta_tile_count_k
 
                 #
                 # Slice to per mma tile index
@@ -1714,6 +1721,57 @@ class Sm100GroupedBlockScaledGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+
+    @cute.jit
+    def dispatch_tile_info_from_prefix(
+        self,
+        tile_idx: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        group_count: cutlass.Constexpr,
+        problem_sizes_mnkl: cute.Tensor,
+        prefix_group_num_clusters: cute.Tensor,
+    ) -> tuple[
+        cutlass.Int32,
+        cutlass.Int32,
+        cutlass.Int32,
+        cutlass.Int32,
+        cutlass.Int32,
+        cutlass.Int32,
+        cutlass.Int32,
+    ]:
+        tile_idx_m, tile_idx_n, tile_idx_l = tile_idx
+        group_idx = cutlass.Int32(0)
+
+        # Compile-time-unrolled linear scan over the host-prepared prefix array.
+        for group_idx_candidate in cutlass.range_constexpr(group_count):
+            if tile_idx_l >= prefix_group_num_clusters[group_idx_candidate]:
+                group_idx = cutlass.Int32(group_idx_candidate)
+
+        problem_shape_m = problem_sizes_mnkl[(group_idx, 0)]
+        problem_shape_n = problem_sizes_mnkl[(group_idx, 1)]
+        problem_shape_k = problem_sizes_mnkl[(group_idx, 2)]
+
+        cluster_tile_count_n = (
+            problem_shape_n + self.cluster_tile_shape_mnk[1] - 1
+        ) // self.cluster_tile_shape_mnk[1]
+        linear_cluster_idx_in_group = tile_idx_l - prefix_group_num_clusters[group_idx]
+        cluster_idx_m = linear_cluster_idx_in_group // cluster_tile_count_n
+        cluster_idx_n = linear_cluster_idx_in_group % cluster_tile_count_n
+
+        cta_tile_idx_m = cluster_idx_m * self.cluster_shape_mn[0] + tile_idx_m
+        cta_tile_idx_n = cluster_idx_n * self.cluster_shape_mn[1] + tile_idx_n
+        cta_tile_count_k = (
+            problem_shape_k + self.cluster_tile_shape_mnk[2] - 1
+        ) // self.cluster_tile_shape_mnk[2]
+
+        return (
+            group_idx,
+            problem_shape_m,
+            problem_shape_n,
+            problem_shape_k,
+            cta_tile_idx_m,
+            cta_tile_idx_n,
+            cta_tile_count_k,
+        )
 
     @cute.jit
     def make_tensor_abc_for_tensormap_update(
@@ -2250,6 +2308,23 @@ def _count_clusters_for_tiler(problem_sizes, mma_tiler_mn, cluster_shape_mn):
     return total
 
 
+def _build_prefix_group_num_clusters(problem_sizes, mma_tiler_mn, cluster_shape_mn):
+    """Prefix-sum of cluster counts per group, starts at 0 and has length group_count + 1."""
+    cluster_tile_mn = (
+        mma_tiler_mn[0] * cluster_shape_mn[0],
+        mma_tiler_mn[1] * cluster_shape_mn[1],
+    )
+    prefix = [0]
+    running = 0
+    for m, n, _, _ in problem_sizes:
+        running += (
+            ((m + cluster_tile_mn[0] - 1) // cluster_tile_mn[0])
+            * ((n + cluster_tile_mn[1] - 1) // cluster_tile_mn[1])
+        )
+        prefix.append(running)
+    return prefix
+
+
 def _select_tma_cache_policy(problem_sizes: List[Tuple[int, int, int, int]]) -> int:
     """Shape-based cache hint policy.
 
@@ -2305,9 +2380,10 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     cluster_shape_mn = CLUSTER_SHAPE_MN  # (1, 1)
     cache_policy = _select_tma_cache_policy(problem_sizes)
     problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
-    total_num_clusters = _count_clusters_for_tiler(
+    prefix_group_num_clusters = _build_prefix_group_num_clusters(
         problem_sizes, mma_tiler_mn, cluster_shape_mn
     )
+    total_num_clusters = prefix_group_num_clusters[-1]
     required_cta_slots = total_num_clusters * (cluster_shape_mn[0] * cluster_shape_mn[1])
     if required_cta_slots > TENSORMAP_WORKSPACE_SLOTS:
         raise ValueError(
@@ -2335,6 +2411,9 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
     problem_sizes_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_groups, 4), stride_order=(1, 0)
     )
+    prefix_group_num_clusters_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_groups + 1,), stride_order=(0,)
+    )
     strides_abc_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_groups, 3, 2), stride_order=(2, 1, 0)
     )
@@ -2356,6 +2435,7 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
         grouped_blockscaled_gemm,
         num_groups,
         problem_sizes_fake,
+        prefix_group_num_clusters_fake,
         strides_abc_fake,
         ptrs_abc_fake,
         ptrs_sfasfb_fake,
@@ -2371,9 +2451,15 @@ def compile_kernel(problem_sizes: List[Tuple[int, int, int, int]]):
 # ---------------------------------------------------------------------------
 # Shape metadata (cached)
 # ---------------------------------------------------------------------------
-def _get_or_build_metadata(problem_sizes, problem_sizes_key):
+def _get_or_build_metadata(
+    problem_sizes,
+    problem_sizes_key,
+    mma_tiler_mn,
+    cluster_shape_mn,
+):
     """Return cached (or freshly built) shape-derived GPU tensors."""
-    cached = _metadata_cache.get(problem_sizes_key)
+    metadata_cache_key = (problem_sizes_key, tuple(mma_tiler_mn), tuple(cluster_shape_mn))
+    cached = _metadata_cache.get(metadata_cache_key)
     if cached is not None:
         return cached
 
@@ -2390,15 +2476,22 @@ def _get_or_build_metadata(problem_sizes, problem_sizes_key):
          Sm100GroupedBlockScaledGemmKernel.bytes_per_tensormap // 8),
         dtype=torch.int64, device="cuda",
     )
-    total_num_clusters = _count_clusters(problem_sizes)
+    prefix_group_num_clusters = _build_prefix_group_num_clusters(
+        problem_sizes, mma_tiler_mn, cluster_shape_mn
+    )
+    tensor_of_prefix_group_num_clusters = torch.tensor(
+        prefix_group_num_clusters, dtype=torch.int32, device="cuda"
+    )
+    total_num_clusters = prefix_group_num_clusters[-1]
 
     result = (
         tensor_of_problem_sizes,
         tensor_of_strides_abc,
         tensor_of_tensormap,
+        tensor_of_prefix_group_num_clusters,
         total_num_clusters,
     )
-    _metadata_cache[problem_sizes_key] = result
+    _metadata_cache[metadata_cache_key] = result
     return result
 
 
@@ -2434,16 +2527,18 @@ def custom_kernel(data: input_t) -> output_t:
         problem_sizes_key = tuple(tuple(ps) for ps in problem_sizes)
 
         compiled_func = compile_kernel(problem_sizes)
+        all_n_7168 = all(n == 7168 for _, n, _, _ in problem_sizes)
+        mma_tiler_mn = (128, 256) if all_n_7168 else MMA_TILER_MN
 
         (tensor_of_problem_sizes,
          tensor_of_strides_abc,
          tensor_of_tensormap,
-         _) = _get_or_build_metadata(problem_sizes, problem_sizes_key)
-
-        all_n_7168 = all(n == 7168 for _, n, _, _ in problem_sizes)
-        mma_tiler_mn = (128, 256) if all_n_7168 else MMA_TILER_MN
-        total_num_clusters = _count_clusters_for_tiler(
-            problem_sizes, mma_tiler_mn, CLUSTER_SHAPE_MN
+         tensor_of_prefix_group_num_clusters,
+         total_num_clusters) = _get_or_build_metadata(
+            problem_sizes,
+            problem_sizes_key,
+            mma_tiler_mn,
+            CLUSTER_SHAPE_MN,
         )
         required_cta_slots = total_num_clusters * (
             CLUSTER_SHAPE_MN[0] * CLUSTER_SHAPE_MN[1]
@@ -2461,6 +2556,7 @@ def custom_kernel(data: input_t) -> output_t:
 
         compiled_func(
             tensor_of_problem_sizes,
+            tensor_of_prefix_group_num_clusters,
             tensor_of_strides_abc,
             tensor_of_abc_ptrs,
             tensor_of_sfasfb_ptrs,
